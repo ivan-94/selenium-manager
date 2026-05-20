@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
+	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
 )
 
@@ -90,6 +92,64 @@ func TestHealthzIsBootstrapSafe(t *testing.T) {
 	}
 }
 
+func TestBrowserSearchEndpointReturnsNormalizedChromeResults(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+
+	source := catalog.StaticTagSource{Page: readChromeTagsFixture(t)}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:       appSupport,
+		ListenAddr:       "127.0.0.1:49321",
+		Version:          "test-version",
+		CatalogSource:    source,
+		HostArchitecture: "arm64",
+	}))
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v1/browsers/search?browser=chrome&q=119", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+appSupport.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/browsers/search error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/browsers/search status = %d, want 200", resp.StatusCode)
+	}
+
+	var search BrowserSearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&search); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	if search.Browser != "chrome" {
+		t.Fatalf("Browser = %q, want chrome", search.Browser)
+	}
+	if len(search.Results) != 1 {
+		t.Fatalf("len(Results) = %d, want 1", len(search.Results))
+	}
+	result := search.Results[0]
+	if result.BrowserVersion != "119.0" {
+		t.Fatalf("BrowserVersion = %q, want 119.0", result.BrowserVersion)
+	}
+	if result.ImageTag != "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404" {
+		t.Fatalf("ImageTag = %q, want full tag", result.ImageTag)
+	}
+	if len(result.Platforms) != 1 || result.Platforms[0] != "linux/amd64" {
+		t.Fatalf("Platforms = %#v, want linux/amd64", result.Platforms)
+	}
+	if len(result.Warnings) != 1 {
+		t.Fatalf("Warnings = %#v, want Apple Silicon warning", result.Warnings)
+	}
+}
+
 func TestDefaultListenAddrIsLocalhostOnly(t *testing.T) {
 	if !IsLocalListenAddr(DefaultListenAddr) {
 		t.Fatalf("DefaultListenAddr %q must be localhost-only", DefaultListenAddr)
@@ -99,4 +159,17 @@ func TestDefaultListenAddrIsLocalhostOnly(t *testing.T) {
 			t.Fatalf("IsLocalListenAddr(%q) = true, want false", addr)
 		}
 	}
+}
+
+func readChromeTagsFixture(t *testing.T) catalog.DockerHubTagsPage {
+	t.Helper()
+	fixture, err := os.ReadFile("../catalog/testdata/dockerhub_standalone_chrome_tags.json")
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	var page catalog.DockerHubTagsPage
+	if err := json.Unmarshal(fixture, &page); err != nil {
+		t.Fatalf("decode fixture: %v", err)
+	}
+	return page
 }

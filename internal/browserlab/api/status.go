@@ -4,18 +4,22 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"time"
 
+	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
 )
 
 const DefaultListenAddr = "127.0.0.1:49321"
 
 type ServerOptions struct {
-	AppSupport config.AppSupport
-	ListenAddr string
-	Version    string
+	AppSupport       config.AppSupport
+	ListenAddr       string
+	Version          string
+	CatalogSource    catalog.TagSource
+	HostArchitecture string
 }
 
 type StatusResponse struct {
@@ -51,12 +55,25 @@ type StatusProblem struct {
 	Message string `json:"message"`
 }
 
+type BrowserSearchResponse struct {
+	Browser string                        `json:"browser"`
+	Query   string                        `json:"query"`
+	Results []catalog.ChromeVersionResult `json:"results"`
+}
+
 func NewHandler(options ServerOptions) http.Handler {
 	if options.ListenAddr == "" {
 		options.ListenAddr = DefaultListenAddr
 	}
 	if options.Version == "" {
 		options.Version = "dev"
+	}
+	if options.CatalogSource == nil {
+		source := catalog.NewDockerHubTagSource()
+		options.CatalogSource = source
+	}
+	if options.HostArchitecture == "" {
+		options.HostArchitecture = runtime.GOARCH
 	}
 
 	mux := http.NewServeMux()
@@ -75,6 +92,43 @@ func NewHandler(options ServerOptions) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, NewStatusResponse(options))
+	})
+	mux.HandleFunc("GET /v1/browsers/search", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browser := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("browser")))
+		if browser == "" {
+			browser = "chrome"
+		}
+		if browser != "chrome" {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "unsupported_browser",
+				Message: "only official Selenium Chrome search is supported in this slice",
+			})
+			return
+		}
+		query := strings.TrimSpace(r.URL.Query().Get("q"))
+		results, err := catalog.SearchChromeVersions(r.Context(), options.CatalogSource, catalog.SearchOptions{
+			Query:            query,
+			HostArchitecture: options.HostArchitecture,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, StatusProblem{
+				Code:    "catalog_search_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, BrowserSearchResponse{
+			Browser: browser,
+			Query:   query,
+			Results: results,
+		})
 	})
 	return mux
 }
