@@ -243,7 +243,65 @@ public protocol SessionClosing {
     func closeSession(sessionId: String) async throws -> SessionCloseResponse
 }
 
-public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening, InstalledBrowserDisabling, InstalledBrowserUninstalling, ActiveSessionListing, SessionClosing {
+public struct ScreenshotArtifact: Decodable, Equatable, Identifiable {
+    public var id: String { screenshotPath }
+
+    public let groupType: String
+    public let groupId: String
+    public let sessionId: String?
+    public let runId: String?
+    public let browserName: String
+    public let browserVersion: String
+    public let requestedUrl: String?
+    public let currentUrl: String?
+    public let title: String?
+    public let capturedAt: String
+    public let groupDir: String
+    public let screenshotPath: String
+    public let metadataPath: String
+    public let resultPath: String
+    public let summaryPath: String
+
+    public init(
+        groupType: String,
+        groupId: String,
+        sessionId: String?,
+        runId: String?,
+        browserName: String,
+        browserVersion: String,
+        requestedUrl: String?,
+        currentUrl: String?,
+        title: String?,
+        capturedAt: String,
+        groupDir: String,
+        screenshotPath: String,
+        metadataPath: String,
+        resultPath: String,
+        summaryPath: String
+    ) {
+        self.groupType = groupType
+        self.groupId = groupId
+        self.sessionId = sessionId
+        self.runId = runId
+        self.browserName = browserName
+        self.browserVersion = browserVersion
+        self.requestedUrl = requestedUrl
+        self.currentUrl = currentUrl
+        self.title = title
+        self.capturedAt = capturedAt
+        self.groupDir = groupDir
+        self.screenshotPath = screenshotPath
+        self.metadataPath = metadataPath
+        self.resultPath = resultPath
+        self.summaryPath = summaryPath
+    }
+}
+
+public protocol ScreenshotCapturing {
+    func captureSessionScreenshot(session: ManualSessionResponse) async throws -> ScreenshotArtifact
+}
+
+public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening, InstalledBrowserDisabling, InstalledBrowserUninstalling, ActiveSessionListing, SessionClosing, ScreenshotCapturing {
     private let baseURL: URL
     private let tokenFile: URL
     private let session: URLSession
@@ -451,6 +509,30 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
         return try JSONDecoder().decode(SessionCloseResponse.self, from: data)
     }
 
+    public func captureSessionScreenshot(session: ManualSessionResponse) async throws -> ScreenshotArtifact {
+        let token = try readToken()
+        let body = SessionScreenshotRequest(session: session)
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1")
+                .appendingPathComponent("sessions")
+                .appendingPathComponent("screenshot")
+        )
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(body)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await self.session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw DaemonStatusClientError.badHTTPStatus(-1)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(ScreenshotArtifact.self, from: data)
+    }
+
     private func readToken() throws -> String {
         do {
             return try String(contentsOf: tokenFile, encoding: .utf8)
@@ -458,6 +540,26 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
         } catch {
             throw DaemonStatusClientError.tokenMissing(tokenFile.path)
         }
+    }
+}
+
+private struct SessionScreenshotRequest: Encodable {
+    let sessionId: String
+    let browserName: String
+    let browserVersion: String
+    let requestedUrl: String
+    let currentUrl: String?
+    let title: String?
+    let webdriverEndpoint: String
+
+    init(session: ManualSessionResponse) {
+        sessionId = session.sessionId
+        browserName = session.browserName
+        browserVersion = session.browserVersion
+        requestedUrl = session.requestedUrl
+        currentUrl = session.currentUrl
+        title = session.title
+        webdriverEndpoint = session.webdriverEndpoint
     }
 }
 
@@ -537,6 +639,14 @@ public struct ActiveSessionRow: Equatable, Identifiable {
     public let session: ManualSessionResponse
 }
 
+public struct ScreenshotArtifactRow: Equatable, Identifiable {
+    public let id: String
+    public let title: String
+    public let detail: String
+    public let screenshotURL: URL
+    public let artifact: ScreenshotArtifact
+}
+
 @MainActor
 public final class BrowserSearchViewModel: ObservableObject {
     @Published public var query: String = ""
@@ -548,6 +658,8 @@ public final class BrowserSearchViewModel: ObservableObject {
     @Published public var targetURL: String = ""
     @Published public private(set) var activeSession: ManualSessionResponse?
     @Published public private(set) var activeSessionRows: [ActiveSessionRow] = []
+    @Published public private(set) var capturingScreenshot: Bool = false
+    @Published public private(set) var recentArtifacts: [ScreenshotArtifactRow] = []
     @Published public private(set) var installMessages: [String: String] = [:]
     @Published public private(set) var installedMessages: [String: String] = [:]
     @Published public var deleteImageOnUninstall: Bool = false
@@ -563,6 +675,7 @@ public final class BrowserSearchViewModel: ObservableObject {
     private let uninstaller: InstalledBrowserUninstalling?
     private let sessionLister: ActiveSessionListing?
     private let sessionCloser: SessionClosing?
+    private let screenshotCapturer: ScreenshotCapturing?
 
     public init(
         client: BrowserVersionSearching,
@@ -572,7 +685,8 @@ public final class BrowserSearchViewModel: ObservableObject {
         disabler: InstalledBrowserDisabling? = nil,
         uninstaller: InstalledBrowserUninstalling? = nil,
         sessionLister: ActiveSessionListing? = nil,
-        sessionCloser: SessionClosing? = nil
+        sessionCloser: SessionClosing? = nil,
+        screenshotCapturer: ScreenshotCapturing? = nil
     ) {
         self.client = client
         self.installer = installer
@@ -582,6 +696,7 @@ public final class BrowserSearchViewModel: ObservableObject {
         self.uninstaller = uninstaller
         self.sessionLister = sessionLister
         self.sessionCloser = sessionCloser
+        self.screenshotCapturer = screenshotCapturer
     }
 
     public func search(query: String? = nil) async {
@@ -673,6 +788,20 @@ public final class BrowserSearchViewModel: ObservableObject {
                 activeSession = nil
             }
             await refreshActiveSessions()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func captureActiveSessionScreenshot() async {
+        guard let screenshotCapturer, let activeSession else { return }
+        capturingScreenshot = true
+        errorMessage = nil
+        defer { capturingScreenshot = false }
+
+        do {
+            let artifact = try await screenshotCapturer.captureSessionScreenshot(session: activeSession)
+            recentArtifacts.insert(Self.artifactRow(for: artifact), at: 0)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -782,6 +911,22 @@ public final class BrowserSearchViewModel: ObservableObject {
     private static func displayBrowserName(_ name: String) -> String {
         guard let first = name.first else { return name }
         return first.uppercased() + name.dropFirst()
+    }
+
+    private static func artifactRow(for artifact: ScreenshotArtifact) -> ScreenshotArtifactRow {
+        let browserName = artifact.browserName.isEmpty ? "Browser" : artifact.browserName.prefix(1).uppercased() + artifact.browserName.dropFirst()
+        let details = [
+            "Screenshot: \(artifact.screenshotPath)",
+            "Metadata: \(artifact.metadataPath)",
+            "Summary: \(artifact.summaryPath)"
+        ].joined(separator: "\n")
+        return ScreenshotArtifactRow(
+            id: artifact.screenshotPath,
+            title: "\(browserName) \(artifact.browserVersion) - \(artifact.capturedAt)",
+            detail: details,
+            screenshotURL: URL(fileURLWithPath: artifact.screenshotPath),
+            artifact: artifact
+        )
     }
 }
 
@@ -926,6 +1071,12 @@ public struct BrowserSearchView: View {
                         Text("Session \(session.sessionId)")
                             .font(.headline)
                         Spacer()
+                        Button(viewModel.capturingScreenshot ? "Capturing" : "Capture") {
+                            Task {
+                                await viewModel.captureActiveSessionScreenshot()
+                            }
+                        }
+                        .disabled(viewModel.capturingScreenshot)
                         if let url = viewModel.activeNoVNCURL {
                             Link("Open External", destination: url)
                         }
@@ -941,6 +1092,26 @@ public struct BrowserSearchView: View {
                             .frame(minHeight: 260)
                     }
                 }
+            }
+            if !viewModel.recentArtifacts.isEmpty {
+                Text("Recent Artifacts")
+                    .font(.headline)
+                List(viewModel.recentArtifacts) { artifact in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(artifact.title)
+                                .font(.headline)
+                            Spacer()
+                            Link("Open", destination: artifact.screenshotURL)
+                        }
+                        Text(artifact.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(minHeight: 100)
             }
         }
         .task {

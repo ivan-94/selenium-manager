@@ -20,7 +20,8 @@ struct BrowserLabApplication: App {
                     disabler: browserClient,
                     uninstaller: browserClient,
                     sessionLister: browserClient,
-                    sessionCloser: browserClient
+                    sessionCloser: browserClient,
+                    screenshotCapturer: browserClient
                 ))
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24)
