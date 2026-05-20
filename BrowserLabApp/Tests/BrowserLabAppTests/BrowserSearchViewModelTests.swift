@@ -99,6 +99,73 @@ final class BrowserSearchViewModelTests: XCTestCase {
         let installMessages = await viewModel.installMessages
         XCTAssertTrue(installMessages[result.imageTag]?.contains("pull_failed") == true)
     }
+
+    func testDisableInstalledBrowserRefreshesRowsAndShowsMessage() async {
+        let imageTag = "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+        let installed = InstalledBrowserRecord(
+            family: "chrome",
+            version: "119.0",
+            imageTag: imageTag,
+            platform: "linux/amd64",
+            source: "selenium-dockerhub",
+            enabled: true
+        )
+        let disabled = InstalledBrowserRecord(
+            family: "chrome",
+            version: "119.0",
+            imageTag: imageTag,
+            platform: "linux/amd64",
+            source: "selenium-dockerhub",
+            enabled: false
+        )
+        let manager = FakeBrowserManager(
+            searchResponse: .success(.init(browser: "chrome", query: "", results: [])),
+            installResponse: .failure(NSError(domain: "BrowserLab", code: 1)),
+            installedResponse: .success(.init(browsers: [disabled])),
+            disableResponse: .success(.init(record: disabled))
+        )
+        let viewModel = await BrowserSearchViewModel(client: manager, lister: manager, disabler: manager)
+
+        await viewModel.disable(record: installed)
+
+        let rows = await viewModel.installedRows
+        let messages = await viewModel.installedMessages
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertFalse(rows[0].enabled)
+        XCTAssertTrue(messages[imageTag]?.contains("Disabled Chrome 119.0") == true)
+    }
+
+    func testUninstallInstalledBrowserRequiresExplicitImageDeleteConfirmation() async {
+        let imageTag = "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+        let installed = InstalledBrowserRecord(
+            family: "chrome",
+            version: "119.0",
+            imageTag: imageTag,
+            platform: "linux/amd64",
+            source: "selenium-dockerhub",
+            enabled: true
+        )
+        let manager = FakeBrowserManager(
+            searchResponse: .success(.init(browser: "chrome", query: "", results: [])),
+            installResponse: .failure(NSError(domain: "BrowserLab", code: 1)),
+            installedResponse: .success(.init(browsers: [])),
+            uninstallResponses: [
+                .failure(NSError(domain: "BrowserLab", code: 400, userInfo: [NSLocalizedDescriptionKey: "image_delete_confirmation_required"])),
+                .success(.init(record: installed, imageDeleted: true))
+            ]
+        )
+        let viewModel = await BrowserSearchViewModel(client: manager, lister: manager, uninstaller: manager)
+
+        await viewModel.uninstall(record: installed, deleteImage: true, confirmDeleteImage: false)
+        var messages = await viewModel.installedMessages
+        XCTAssertTrue(messages[imageTag]?.contains("image_delete_confirmation_required") == true)
+
+        await viewModel.uninstall(record: installed, deleteImage: true, confirmDeleteImage: true)
+        messages = await viewModel.installedMessages
+        let rows = await viewModel.installedRows
+        XCTAssertTrue(messages[imageTag]?.contains("Deleted Docker image") == true)
+        XCTAssertTrue(rows.isEmpty)
+    }
 }
 
 private struct FakeBrowserSearchClient: BrowserVersionSearching {
@@ -109,10 +176,26 @@ private struct FakeBrowserSearchClient: BrowserVersionSearching {
     }
 }
 
-private struct FakeBrowserManager: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing {
+private final class FakeBrowserManager: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, InstalledBrowserDisabling, InstalledBrowserUninstalling {
     let searchResponse: Result<BrowserSearchResponse, Error>
     let installResponse: Result<BrowserInstallResponse, Error>
     let installedResponse: Result<InstalledBrowsersResponse, Error>
+    let disableResponse: Result<BrowserDisableResponse, Error>
+    var uninstallResponses: [Result<BrowserUninstallResponse, Error>]
+
+    init(
+        searchResponse: Result<BrowserSearchResponse, Error>,
+        installResponse: Result<BrowserInstallResponse, Error>,
+        installedResponse: Result<InstalledBrowsersResponse, Error>,
+        disableResponse: Result<BrowserDisableResponse, Error> = .failure(NSError(domain: "BrowserLab", code: 1)),
+        uninstallResponses: [Result<BrowserUninstallResponse, Error>] = []
+    ) {
+        self.searchResponse = searchResponse
+        self.installResponse = installResponse
+        self.installedResponse = installedResponse
+        self.disableResponse = disableResponse
+        self.uninstallResponses = uninstallResponses
+    }
 
     func searchChromeVersions(query: String) async throws -> BrowserSearchResponse {
         try searchResponse.get()
@@ -124,5 +207,16 @@ private struct FakeBrowserManager: BrowserVersionSearching, BrowserVersionInstal
 
     func listInstalledBrowsers() async throws -> InstalledBrowsersResponse {
         try installedResponse.get()
+    }
+
+    func disableBrowser(record: InstalledBrowserRecord) async throws -> BrowserDisableResponse {
+        try disableResponse.get()
+    }
+
+    func uninstallBrowser(record: InstalledBrowserRecord, deleteImage: Bool, confirmDeleteImage: Bool) async throws -> BrowserUninstallResponse {
+        if uninstallResponses.isEmpty {
+            throw NSError(domain: "BrowserLab", code: 1)
+        }
+        return try uninstallResponses.removeFirst().get()
     }
 }
