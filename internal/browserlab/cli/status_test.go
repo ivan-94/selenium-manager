@@ -14,8 +14,10 @@ import (
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
 )
 
 func TestStatusJSONReportsDaemonShape(t *testing.T) {
@@ -356,8 +358,107 @@ func TestBrowsersJSONListsInstalledRegistryEntries(t *testing.T) {
 	}
 }
 
+func TestGridStartJSONReportsStableWebDriverEndpoint(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport: appSupport,
+		GridRunner: &cliGridRunner{},
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"grid", "start", "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(grid start --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.GridStatusResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("grid JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.Status.State != "running" {
+		t.Fatalf("grid state = %q, want running", payload.Status.State)
+	}
+	if payload.Status.WebDriverEndpoint != "http://127.0.0.1:4444/wd/hub" {
+		t.Fatalf("webdriver endpoint = %q, want stable localhost endpoint", payload.Status.WebDriverEndpoint)
+	}
+	if len(payload.Status.Browsers) != 1 || payload.Status.Browsers[0].BrowserName != "chrome" || payload.Status.Browsers[0].BrowserVersion != "119.0" {
+		t.Fatalf("browsers = %+v, want chrome 119.0 capability target", payload.Status.Browsers)
+	}
+}
+
+func TestGridConfigHumanPrintsReadOnlyConfig(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport: appSupport,
+		GridRunner: &cliGridRunner{},
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"grid", "config", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(grid config) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	if got := stdout.String(); !strings.Contains(got, "[docker]") || !strings.Contains(got, `"browserVersion\":\"119.0\"`) {
+		t.Fatalf("stdout = %q, want generated read-only Dynamic Grid config", got)
+	}
+}
+
 type cliRecordingPuller struct {
 	requests []install.PullRequest
+}
+
+type cliGridRunner struct {
+	running bool
+}
+
+func (runner *cliGridRunner) Start(_ context.Context, request grid.StartRequest) (grid.RuntimeState, error) {
+	runner.running = true
+	return grid.RuntimeState{State: "running", ContainerName: request.ContainerName, ContainerID: "grid-123"}, nil
+}
+
+func (runner *cliGridRunner) Status(_ context.Context, containerName string) (grid.RuntimeState, error) {
+	if runner.running {
+		return grid.RuntimeState{State: "running", ContainerName: containerName, ContainerID: "grid-123"}, nil
+	}
+	return grid.RuntimeState{State: "stopped", ContainerName: containerName}, nil
+}
+
+func (runner *cliGridRunner) Stop(_ context.Context, containerName string) (grid.RuntimeState, error) {
+	runner.running = false
+	return grid.RuntimeState{State: "stopped", ContainerName: containerName}, nil
 }
 
 func (puller *cliRecordingPuller) PullImage(_ context.Context, request install.PullRequest, report func(install.ProgressEvent)) error {
