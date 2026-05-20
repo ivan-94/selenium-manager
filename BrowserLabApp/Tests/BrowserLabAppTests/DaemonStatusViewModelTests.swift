@@ -8,7 +8,8 @@ final class DaemonStatusViewModelTests: XCTestCase {
             service: "browserlabd",
             version: "test-version",
             api: .init(bind: "127.0.0.1:49321", localhostOnly: true),
-            paths: nil
+            paths: nil,
+            nativeRuntimes: []
         )
         let viewModel = await DaemonStatusViewModel(client: FakeStatusClient(result: .success(status)))
 
@@ -16,6 +17,44 @@ final class DaemonStatusViewModelTests: XCTestCase {
 
         let displayState = await viewModel.displayState
         XCTAssertEqual(displayState, .running(status))
+    }
+
+    func testNativeSafariRuntimeDisplaysSeparatelyFromDockerBrowsers() async {
+        let safari = NativeRuntimeStatus(
+            id: "safari",
+            displayName: "Safari",
+            kind: "native",
+            installable: false,
+            status: "setup_required",
+            browserAvailable: true,
+            browserVersion: "17.5",
+            driverAvailable: false,
+            driverVersion: nil,
+            message: "Safari is installed, but SafariDriver is not available to BrowserLab.",
+            setupGuidance: ["Enable Safari WebDriver support with: safaridriver --enable"],
+            outOfScope: "Old Safari versions are out of scope for the Docker Selenium MVP. BrowserLab only detects the current macOS Safari and SafariDriver."
+        )
+        let status = DaemonStatus(
+            state: "running",
+            service: "browserlabd",
+            version: "test-version",
+            api: .init(bind: "127.0.0.1:49321", localhostOnly: true),
+            paths: nil,
+            nativeRuntimes: [safari]
+        )
+
+        XCTAssertEqual(status.nativeRuntimeDisplays, [
+            NativeRuntimeDisplay(
+                title: "Safari",
+                subtitle: "setup_required - native - non-installable",
+                details: [
+                    "Safari version: 17.5",
+                    "Safari is installed, but SafariDriver is not available to BrowserLab.",
+                    "Setup: Enable Safari WebDriver support with: safaridriver --enable",
+                    "Old Safari versions are out of scope for the Docker Selenium MVP. BrowserLab only detects the current macOS Safari and SafariDriver.",
+                ]
+            )
+        ])
     }
 
     func testRefreshShowsStoppedWhenDaemonCannotBeReached() async {
