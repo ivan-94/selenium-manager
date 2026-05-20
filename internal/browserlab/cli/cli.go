@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
@@ -38,6 +40,8 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 		return runDaemon(args[1:], stdout, stderr, options)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
+	case "search":
+		return runSearch(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		writeUsage(stdout)
 		return 0
@@ -49,7 +53,39 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 
 func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: browserlab status [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab search chrome [query] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
+}
+
+func runSearch(args []string, stdout io.Writer, stderr io.Writer) int {
+	parsed, err := parseSearchArgs(args)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "usage: browserlab search chrome [query] [--json] [--base-url URL]")
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeSearchError(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	search, err := fetchBrowserSearch(ctx, parsed.baseURL, appSupport.Token, parsed.browser, parsed.query)
+	if err != nil {
+		writeSearchError(stdout, parsed.jsonOutput, "daemon_unreachable", err.Error())
+		return 2
+	}
+
+	if parsed.jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(search)
+		return 0
+	}
+	writeSearchHuman(stdout, search)
+	return 0
 }
 
 func runStatus(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -212,6 +248,41 @@ func fetchStatus(ctx context.Context, baseURL string, token string) (api.StatusR
 	return status, nil
 }
 
+func fetchBrowserSearch(ctx context.Context, baseURL string, token string, browser string, query string) (api.BrowserSearchResponse, error) {
+	endpoint, err := url.Parse(baseURL + "/v1/browsers/search")
+	if err != nil {
+		return api.BrowserSearchResponse{}, err
+	}
+	values := endpoint.Query()
+	values.Set("browser", browser)
+	if query != "" {
+		values.Set("q", query)
+	}
+	endpoint.RawQuery = values.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint.String(), nil)
+	if err != nil {
+		return api.BrowserSearchResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.BrowserSearchResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return api.BrowserSearchResponse{}, fmt.Errorf("daemon returned HTTP %d", resp.StatusCode)
+	}
+
+	var search api.BrowserSearchResponse
+	if err := json.NewDecoder(resp.Body).Decode(&search); err != nil {
+		return api.BrowserSearchResponse{}, err
+	}
+	return search, nil
+}
+
 func writeStopped(stdout io.Writer, asJSON bool, code string, message string) {
 	if asJSON {
 		_ = json.NewEncoder(stdout).Encode(api.StatusResponse{
@@ -226,6 +297,95 @@ func writeStopped(stdout io.Writer, asJSON bool, code string, message string) {
 		return
 	}
 	fmt.Fprintln(stdout, "BrowserLab daemon: stopped")
+}
+
+type searchArgs struct {
+	browser    string
+	query      string
+	jsonOutput bool
+	baseURL    string
+}
+
+func parseSearchArgs(args []string) (searchArgs, error) {
+	parsed := searchArgs{baseURL: defaultBaseURL}
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			parsed.jsonOutput = true
+		case "--base-url":
+			if i+1 >= len(args) {
+				return searchArgs{}, fmt.Errorf("--base-url requires a URL")
+			}
+			parsed.baseURL = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return searchArgs{}, fmt.Errorf("unknown flag: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) == 0 {
+		return searchArgs{}, fmt.Errorf("browser is required")
+	}
+	if strings.ToLower(positionals[0]) != "chrome" {
+		return searchArgs{}, fmt.Errorf("only chrome search is supported")
+	}
+	parsed.browser = "chrome"
+	if len(positionals) > 1 {
+		parsed.query = positionals[1]
+	}
+	if len(positionals) > 2 {
+		return searchArgs{}, fmt.Errorf("too many positional arguments")
+	}
+	return parsed, nil
+}
+
+func writeSearchHuman(stdout io.Writer, search api.BrowserSearchResponse) {
+	if len(search.Results) == 0 {
+		fmt.Fprintf(stdout, "No %s versions found", search.Browser)
+		if search.Query != "" {
+			fmt.Fprintf(stdout, " for %q", search.Query)
+		}
+		fmt.Fprintln(stdout, ".")
+		return
+	}
+	for _, result := range search.Results {
+		fmt.Fprintf(stdout, "Chrome %s", result.BrowserVersion)
+		if result.Recommended {
+			fmt.Fprint(stdout, " (recommended)")
+		}
+		fmt.Fprintln(stdout)
+		fmt.Fprintf(stdout, "  Image: %s\n", result.ImageTag)
+		details := []string{}
+		if result.DriverVersion != "" {
+			details = append(details, "Driver: "+result.DriverVersion)
+		}
+		if result.GridVersion != "" {
+			details = append(details, "Grid: "+result.GridVersion)
+		}
+		if result.ReleaseDate != "" {
+			details = append(details, "Released: "+result.ReleaseDate)
+		}
+		if len(details) > 0 {
+			fmt.Fprintf(stdout, "  %s\n", strings.Join(details, "  "))
+		}
+		if len(result.Platforms) > 0 {
+			fmt.Fprintf(stdout, "  Platforms: %s\n", strings.Join(result.Platforms, ", "))
+		}
+		for _, warning := range result.Warnings {
+			fmt.Fprintf(stdout, "  Warning: %s\n", warning)
+		}
+	}
+}
+
+func writeSearchError(stdout io.Writer, asJSON bool, code string, message string) {
+	if asJSON {
+		_ = json.NewEncoder(stdout).Encode(api.StatusProblem{Code: code, Message: message})
+		return
+	}
+	fmt.Fprintf(stdout, "BrowserLab search failed: %s\n", message)
 }
 
 func Main() {

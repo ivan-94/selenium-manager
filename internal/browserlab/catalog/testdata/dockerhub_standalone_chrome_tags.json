@@ -1,0 +1,56 @@
+{
+  "count": 4,
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "name": "119.0-20260404",
+      "last_updated": "2026-04-13T11:27:19.085681Z",
+      "images": [
+        {
+          "architecture": "amd64",
+          "os": "linux",
+          "variant": null
+        }
+      ]
+    },
+    {
+      "name": "119.0-chromedriver-119.0-20260404",
+      "last_updated": "2026-04-13T11:27:11.200931Z",
+      "images": [
+        {
+          "architecture": "amd64",
+          "os": "linux",
+          "variant": null
+        }
+      ]
+    },
+    {
+      "name": "119.0-chromedriver-119.0-grid-4.43.0-20260404",
+      "last_updated": "2026-04-13T11:27:03.026071Z",
+      "images": [
+        {
+          "architecture": "amd64",
+          "os": "linux",
+          "variant": null
+        },
+        {
+          "architecture": "unknown",
+          "os": "unknown",
+          "variant": null
+        }
+      ]
+    },
+    {
+      "name": "4.43.0-20260404",
+      "last_updated": "2026-04-13T11:26:45.000000Z",
+      "images": [
+        {
+          "architecture": "amd64",
+          "os": "linux",
+          "variant": null
+        }
+      ]
+    }
+  ]
+}

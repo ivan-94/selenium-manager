@@ -4,15 +4,20 @@ import SwiftUI
 struct BrowserLabApplication: App {
     var body: some Scene {
         WindowGroup {
-            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 16) {
                 DaemonStatusView(viewModel: DaemonStatusViewModel(
                     client: URLSessionDaemonStatusClient()
                 ))
                 DaemonLifecycleControlsView(viewModel: DaemonLifecycleViewModel(
                     client: BrowserLabCLIDaemonLifecycleClient()
                 ))
+                BrowserSearchView(viewModel: BrowserSearchViewModel(
+                    client: URLSessionBrowserSearchClient()
+                ))
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
             }
-            .frame(minWidth: 460, minHeight: 280)
+            .frame(minWidth: 640, minHeight: 460)
         }
     }
 }
