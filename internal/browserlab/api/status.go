@@ -12,6 +12,7 @@ import (
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
@@ -26,6 +27,7 @@ type ServerOptions struct {
 	NativeRuntimes   []native.RuntimeStatus
 	CatalogSource    catalog.TagSource
 	ImagePuller      install.ImagePuller
+	GridRunner       grid.RuntimeRunner
 	HostArchitecture string
 }
 
@@ -75,6 +77,14 @@ type BrowserListResponse struct {
 	Browsers []registry.BrowserRecord `json:"browsers"`
 }
 
+type GridStatusResponse struct {
+	Status grid.Status `json:"status"`
+}
+
+type GridConfigResponse struct {
+	Config grid.GeneratedConfig `json:"config"`
+}
+
 func NewHandler(options ServerOptions) http.Handler {
 	if options.ListenAddr == "" {
 		options.ListenAddr = DefaultListenAddr
@@ -95,6 +105,10 @@ func NewHandler(options ServerOptions) http.Handler {
 		CatalogSource:    options.CatalogSource,
 		ImagePuller:      options.ImagePuller,
 		HostArchitecture: options.HostArchitecture,
+	}
+	gridManager := grid.Manager{
+		Root:   options.AppSupport.Paths.Root,
+		Runner: options.GridRunner,
 	}
 
 	mux := http.NewServeMux()
@@ -192,6 +206,98 @@ func NewHandler(options ServerOptions) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, BrowserListResponse{Browsers: browsers})
 	})
+	mux.HandleFunc("GET /v1/grid/status", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		status, err := gridManager.Status(r.Context(), browsers)
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridStatusResponse{Status: status})
+	})
+	mux.HandleFunc("POST /v1/grid/start", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		status, err := gridManager.Start(r.Context(), browsers)
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridStatusResponse{Status: status})
+	})
+	mux.HandleFunc("POST /v1/grid/stop", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		status, err := gridManager.Stop(r.Context(), browsers)
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridStatusResponse{Status: status})
+	})
+	mux.HandleFunc("GET /v1/grid/config", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		generated, err := grid.GenerateConfig(browsers, grid.ConfigOptions{})
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridConfigResponse{Config: generated})
+	})
 	return mux
 }
 
@@ -266,6 +372,22 @@ func writeInstallError(w http.ResponseWriter, err error) {
 	}
 	writeJSON(w, http.StatusInternalServerError, StatusProblem{
 		Code:    "install_failed",
+		Message: err.Error(),
+	})
+}
+
+func writeGridError(w http.ResponseWriter, err error) {
+	var problem grid.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		if problem.Code == "grid_start_failed" || problem.Code == "grid_stop_failed" {
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "grid_failed",
 		Message: err.Error(),
 	})
 }

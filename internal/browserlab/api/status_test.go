@@ -13,8 +13,10 @@ import (
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
 )
 
 func TestStatusEndpointRequiresLocalTokenAndReturnsDaemonStatus(t *testing.T) {
@@ -385,6 +387,97 @@ func TestBrowserInstallEndpointReportsPlatformMismatch(t *testing.T) {
 	}
 }
 
+func TestGridEndpointsStartFromEnabledRegistryAndExposeReadOnlyConfig(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save(enabled) error = %v", err)
+	}
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "118.0",
+		ImageTag: "selenium/standalone-chrome:118.0-chromedriver-118.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  false,
+	})
+	if err != nil {
+		t.Fatalf("Save(disabled) error = %v", err)
+	}
+	runner := &apiGridRunner{}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport: appSupport,
+		GridRunner: runner,
+	}))
+	t.Cleanup(server.Close)
+
+	startReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/grid/start", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(start) error = %v", err)
+	}
+	startReq.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	startResp, err := http.DefaultClient.Do(startReq)
+	if err != nil {
+		t.Fatalf("POST /v1/grid/start error = %v", err)
+	}
+	defer startResp.Body.Close()
+	if startResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/grid/start status = %d, want 200", startResp.StatusCode)
+	}
+	var start GridStatusResponse
+	if err := json.NewDecoder(startResp.Body).Decode(&start); err != nil {
+		t.Fatalf("decode start: %v", err)
+	}
+	if start.Status.State != "running" {
+		t.Fatalf("grid state = %q, want running", start.Status.State)
+	}
+	if start.Status.WebDriverEndpoint != "http://127.0.0.1:4444/wd/hub" {
+		t.Fatalf("webdriver endpoint = %q", start.Status.WebDriverEndpoint)
+	}
+	if len(start.Status.Browsers) != 1 || start.Status.Browsers[0].BrowserVersion != "119.0" {
+		t.Fatalf("grid browsers = %+v, want enabled 119.0 only", start.Status.Browsers)
+	}
+	if runner.startRequest.ConfigPath == "" {
+		t.Fatal("runner did not receive generated config path")
+	}
+
+	configReq, err := http.NewRequest(http.MethodGet, server.URL+"/v1/grid/config", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(config) error = %v", err)
+	}
+	configReq.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	configResp, err := http.DefaultClient.Do(configReq)
+	if err != nil {
+		t.Fatalf("GET /v1/grid/config error = %v", err)
+	}
+	defer configResp.Body.Close()
+	if configResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/grid/config status = %d, want 200", configResp.StatusCode)
+	}
+	var payload GridConfigResponse
+	if err := json.NewDecoder(configResp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode grid config: %v", err)
+	}
+	if !strings.Contains(payload.Config.TOML, `"browserVersion\":\"119.0\"`) {
+		t.Fatalf("config does not include enabled browser version:\n%s", payload.Config.TOML)
+	}
+	if strings.Contains(payload.Config.TOML, "118.0") {
+		t.Fatalf("config included disabled browser:\n%s", payload.Config.TOML)
+	}
+}
+
 func TestDefaultListenAddrIsLocalhostOnly(t *testing.T) {
 	if !IsLocalListenAddr(DefaultListenAddr) {
 		t.Fatalf("DefaultListenAddr %q must be localhost-only", DefaultListenAddr)
@@ -412,6 +505,29 @@ func readChromeTagsFixture(t *testing.T) catalog.DockerHubTagsPage {
 type recordingPuller struct {
 	requests []install.PullRequest
 	err      error
+}
+
+type apiGridRunner struct {
+	startRequest grid.StartRequest
+	running      bool
+}
+
+func (runner *apiGridRunner) Start(_ context.Context, request grid.StartRequest) (grid.RuntimeState, error) {
+	runner.startRequest = request
+	runner.running = true
+	return grid.RuntimeState{State: "running", ContainerName: request.ContainerName, ContainerID: "grid-123"}, nil
+}
+
+func (runner *apiGridRunner) Status(_ context.Context, containerName string) (grid.RuntimeState, error) {
+	if runner.running {
+		return grid.RuntimeState{State: "running", ContainerName: containerName, ContainerID: "grid-123"}, nil
+	}
+	return grid.RuntimeState{State: "stopped", ContainerName: containerName}, nil
+}
+
+func (runner *apiGridRunner) Stop(_ context.Context, containerName string) (grid.RuntimeState, error) {
+	runner.running = false
+	return grid.RuntimeState{State: "stopped", ContainerName: containerName}, nil
 }
 
 func (puller *recordingPuller) PullImage(_ context.Context, request install.PullRequest, report func(install.ProgressEvent)) error {

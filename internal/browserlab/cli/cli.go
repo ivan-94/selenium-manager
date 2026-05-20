@@ -15,6 +15,7 @@ import (
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/lifecycle"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
@@ -48,6 +49,8 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 		return runInstall(args[1:], stdout, stderr)
 	case "browsers":
 		return runBrowsers(args[1:], stdout, stderr)
+	case "grid":
+		return runGrid(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		writeUsage(stdout)
 		return 0
@@ -62,6 +65,7 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "       browserlab search chrome [query] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab install chrome [version] [--image-tag TAG] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab browsers [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab grid <start|stop|status|config> [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
 }
 
@@ -133,6 +137,76 @@ func runBrowsers(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 	writeBrowsersHuman(stdout, list)
 	return 0
+}
+
+func runGrid(args []string, stdout io.Writer, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: browserlab grid <start|stop|status|config> [--json] [--base-url URL]")
+		return 64
+	}
+	command := args[0]
+	flags := flag.NewFlagSet("grid "+command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	jsonOutput := flags.Bool("json", false, "write machine-readable JSON")
+	baseURL := flags.String("base-url", defaultBaseURL, "daemon base URL")
+	if err := flags.Parse(args[1:]); err != nil {
+		return 64
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(stderr, "unexpected argument: %s\n", flags.Arg(0))
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, *jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	switch command {
+	case "start", "stop":
+		status, err := sendGridCommand(ctx, *baseURL, appSupport.Token, command)
+		if err != nil {
+			writeProblem(stdout, *jsonOutput, "grid_failed", err.Error())
+			return 2
+		}
+		if *jsonOutput {
+			_ = json.NewEncoder(stdout).Encode(status)
+			return 0
+		}
+		writeGridStatusHuman(stdout, status.Status)
+		return 0
+	case "status":
+		status, err := fetchGridStatus(ctx, *baseURL, appSupport.Token)
+		if err != nil {
+			writeProblem(stdout, *jsonOutput, "grid_failed", err.Error())
+			return 2
+		}
+		if *jsonOutput {
+			_ = json.NewEncoder(stdout).Encode(status)
+			return 0
+		}
+		writeGridStatusHuman(stdout, status.Status)
+		return 0
+	case "config":
+		config, err := fetchGridConfig(ctx, *baseURL, appSupport.Token)
+		if err != nil {
+			writeProblem(stdout, *jsonOutput, "grid_failed", err.Error())
+			return 2
+		}
+		if *jsonOutput {
+			_ = json.NewEncoder(stdout).Encode(config)
+			return 0
+		}
+		fmt.Fprint(stdout, config.Config.TOML)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "unknown grid command: %s\n", command)
+		return 64
+	}
 }
 
 func runSearch(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -413,6 +487,75 @@ func fetchInstalledBrowsers(ctx context.Context, baseURL string, token string) (
 	return list, nil
 }
 
+func fetchGridStatus(ctx context.Context, baseURL string, token string) (api.GridStatusResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/grid/status", nil)
+	if err != nil {
+		return api.GridStatusResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.GridStatusResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.GridStatusResponse{}, decodeProblem(resp)
+	}
+
+	var status api.GridStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return api.GridStatusResponse{}, err
+	}
+	return status, nil
+}
+
+func sendGridCommand(ctx context.Context, baseURL string, token string, command string) (api.GridStatusResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/grid/"+command, nil)
+	if err != nil {
+		return api.GridStatusResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.GridStatusResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.GridStatusResponse{}, decodeProblem(resp)
+	}
+
+	var status api.GridStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return api.GridStatusResponse{}, err
+	}
+	return status, nil
+}
+
+func fetchGridConfig(ctx context.Context, baseURL string, token string) (api.GridConfigResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/grid/config", nil)
+	if err != nil {
+		return api.GridConfigResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.GridConfigResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.GridConfigResponse{}, decodeProblem(resp)
+	}
+
+	var config api.GridConfigResponse
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return api.GridConfigResponse{}, err
+	}
+	return config, nil
+}
+
 func decodeProblem(resp *http.Response) error {
 	var problem api.StatusProblem
 	if err := json.NewDecoder(resp.Body).Decode(&problem); err == nil && problem.Message != "" {
@@ -605,6 +748,23 @@ func writeBrowsersHuman(stdout io.Writer, list api.BrowserListResponse) {
 		fmt.Fprintf(stdout, "  Image: %s\n", browser.ImageTag)
 		fmt.Fprintf(stdout, "  Platform: %s\n", browser.Platform)
 		fmt.Fprintf(stdout, "  Source: %s\n", browser.Source)
+	}
+}
+
+func writeGridStatusHuman(stdout io.Writer, status grid.Status) {
+	fmt.Fprintf(stdout, "Selenium Grid: %s\n", status.State)
+	fmt.Fprintf(stdout, "WebDriver: %s\n", status.WebDriverEndpoint)
+	fmt.Fprintf(stdout, "Grid UI: %s\n", status.GridURL)
+	if status.ConfigPath != "" {
+		fmt.Fprintf(stdout, "Config: %s\n", status.ConfigPath)
+	}
+	if len(status.Browsers) == 0 {
+		fmt.Fprintln(stdout, "Browsers: none enabled")
+		return
+	}
+	fmt.Fprintln(stdout, "Browsers:")
+	for _, browser := range status.Browsers {
+		fmt.Fprintf(stdout, "- %s %s -> %s\n", browser.BrowserName, browser.BrowserVersion, browser.ImageTag)
 	}
 }
 
