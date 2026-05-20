@@ -16,6 +16,7 @@ struct BrowserLabApplication: App {
                     client: browserClient,
                     installer: browserClient,
                     lister: browserClient,
+                    mobilePresetLister: browserClient,
                     sessionOpener: browserClient,
                     disabler: browserClient,
                     uninstaller: browserClient,

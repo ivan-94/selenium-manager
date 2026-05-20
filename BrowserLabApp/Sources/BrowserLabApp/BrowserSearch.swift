@@ -135,6 +135,58 @@ public protocol InstalledBrowserListing {
     func listInstalledBrowsers() async throws -> InstalledBrowsersResponse
 }
 
+public struct MobileDeviceMetrics: Decodable, Equatable {
+    public let width: Int
+    public let height: Int
+    public let pixelRatio: Double
+
+    public init(width: Int, height: Int, pixelRatio: Double) {
+        self.width = width
+        self.height = height
+        self.pixelRatio = pixelRatio
+    }
+}
+
+public struct MobilePreset: Decodable, Equatable, Identifiable {
+    public let id: String
+    public let name: String
+    public let deviceMetrics: MobileDeviceMetrics
+    public let userAgent: String
+
+    public init(id: String, name: String, deviceMetrics: MobileDeviceMetrics, userAgent: String) {
+        self.id = id
+        self.name = name
+        self.deviceMetrics = deviceMetrics
+        self.userAgent = userAgent
+    }
+}
+
+public struct MobilePresetCatalogResponse: Decodable, Equatable {
+    public let presets: [MobilePreset]
+
+    public init(presets: [MobilePreset]) {
+        self.presets = presets
+    }
+}
+
+public protocol MobilePresetListing {
+    func listMobilePresets() async throws -> MobilePresetCatalogResponse
+}
+
+public struct MobileEmulation: Decodable, Equatable {
+    public let presetId: String
+    public let name: String
+    public let deviceMetrics: MobileDeviceMetrics
+    public let userAgent: String
+
+    public init(presetId: String, name: String, deviceMetrics: MobileDeviceMetrics, userAgent: String) {
+        self.presetId = presetId
+        self.name = name
+        self.deviceMetrics = deviceMetrics
+        self.userAgent = userAgent
+    }
+}
+
 public struct NoVNCResolution: Decodable, Equatable {
     public let url: String?
     public let vncWebSocketUrl: String?
@@ -159,6 +211,7 @@ public struct ManualSessionResponse: Decodable, Equatable {
     public let gridUrl: String
     public let webdriverEndpoint: String
     public let noVnc: NoVNCResolution
+    public let mobileEmulation: MobileEmulation?
     public let startedAt: String
     public let status: String
 
@@ -172,6 +225,7 @@ public struct ManualSessionResponse: Decodable, Equatable {
         gridUrl: String,
         webdriverEndpoint: String,
         noVnc: NoVNCResolution,
+        mobileEmulation: MobileEmulation? = nil,
         startedAt: String,
         status: String = "active"
     ) {
@@ -184,13 +238,14 @@ public struct ManualSessionResponse: Decodable, Equatable {
         self.gridUrl = gridUrl
         self.webdriverEndpoint = webdriverEndpoint
         self.noVnc = noVnc
+        self.mobileEmulation = mobileEmulation
         self.startedAt = startedAt
         self.status = status
     }
 }
 
 public protocol ManualSessionOpening {
-    func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse
+    func openManualSession(browser: InstalledBrowserRecord, url: String?, mobilePresetID: String?) async throws -> ManualSessionResponse
 }
 
 public struct BrowserDisableResponse: Decodable, Equatable {
@@ -255,6 +310,7 @@ public struct ScreenshotArtifact: Decodable, Equatable, Identifiable {
     public let requestedUrl: String?
     public let currentUrl: String?
     public let title: String?
+    public let mobileEmulation: MobileEmulation?
     public let capturedAt: String
     public let groupDir: String
     public let screenshotPath: String
@@ -272,6 +328,7 @@ public struct ScreenshotArtifact: Decodable, Equatable, Identifiable {
         requestedUrl: String?,
         currentUrl: String?,
         title: String?,
+        mobileEmulation: MobileEmulation? = nil,
         capturedAt: String,
         groupDir: String,
         screenshotPath: String,
@@ -288,6 +345,7 @@ public struct ScreenshotArtifact: Decodable, Equatable, Identifiable {
         self.requestedUrl = requestedUrl
         self.currentUrl = currentUrl
         self.title = title
+        self.mobileEmulation = mobileEmulation
         self.capturedAt = capturedAt
         self.groupDir = groupDir
         self.screenshotPath = screenshotPath
@@ -301,7 +359,7 @@ public protocol ScreenshotCapturing {
     func captureSessionScreenshot(session: ManualSessionResponse) async throws -> ScreenshotArtifact
 }
 
-public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening, InstalledBrowserDisabling, InstalledBrowserUninstalling, ActiveSessionListing, SessionClosing, ScreenshotCapturing {
+public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, MobilePresetListing, ManualSessionOpening, InstalledBrowserDisabling, InstalledBrowserUninstalling, ActiveSessionListing, SessionClosing, ScreenshotCapturing {
     private let baseURL: URL
     private let tokenFile: URL
     private let session: URLSession
@@ -393,9 +451,28 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
         return try JSONDecoder().decode(InstalledBrowsersResponse.self, from: data)
     }
 
-    public func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse {
+    public func listMobilePresets() async throws -> MobilePresetCatalogResponse {
         let token = try readToken()
-        let body = ManualSessionRequest(browser: browser, url: url)
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1")
+                .appendingPathComponent("mobile-presets")
+        )
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw DaemonStatusClientError.badHTTPStatus(-1)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(MobilePresetCatalogResponse.self, from: data)
+    }
+
+    public func openManualSession(browser: InstalledBrowserRecord, url: String?, mobilePresetID: String?) async throws -> ManualSessionResponse {
+        let token = try readToken()
+        let body = ManualSessionRequest(browser: browser, url: url, mobilePresetID: mobilePresetID)
         var request = URLRequest(
             url: baseURL
                 .appendingPathComponent("v1")
@@ -551,6 +628,7 @@ private struct SessionScreenshotRequest: Encodable {
     let currentUrl: String?
     let title: String?
     let webdriverEndpoint: String
+    let mobilePresetId: String?
 
     init(session: ManualSessionResponse) {
         sessionId = session.sessionId
@@ -560,6 +638,7 @@ private struct SessionScreenshotRequest: Encodable {
         currentUrl = session.currentUrl
         title = session.title
         webdriverEndpoint = session.webdriverEndpoint
+        mobilePresetId = session.mobileEmulation?.presetId
     }
 }
 
@@ -585,11 +664,13 @@ private struct ManualSessionRequest: Encodable {
     let browserName: String
     let browserVersion: String
     let url: String?
+    let mobilePresetId: String?
 
-    init(browser: InstalledBrowserRecord, url: String?) {
+    init(browser: InstalledBrowserRecord, url: String?, mobilePresetID: String?) {
         browserName = browser.family
         browserVersion = browser.version
         self.url = url
+        mobilePresetId = mobilePresetID
     }
 }
 
@@ -652,6 +733,8 @@ public final class BrowserSearchViewModel: ObservableObject {
     @Published public var query: String = ""
     @Published public private(set) var rows: [BrowserSearchRow] = []
     @Published public private(set) var installedRows: [InstalledBrowserRow] = []
+    @Published public private(set) var mobilePresets: [MobilePreset] = []
+    @Published public var selectedMobilePresetID: String = ""
     @Published public private(set) var isSearching: Bool = false
     @Published public private(set) var installingImageTag: String?
     @Published public private(set) var openingImageTag: String?
@@ -670,6 +753,7 @@ public final class BrowserSearchViewModel: ObservableObject {
     private let client: BrowserVersionSearching
     private let installer: BrowserVersionInstalling?
     private let lister: InstalledBrowserListing?
+    private let mobilePresetLister: MobilePresetListing?
     private let sessionOpener: ManualSessionOpening?
     private let disabler: InstalledBrowserDisabling?
     private let uninstaller: InstalledBrowserUninstalling?
@@ -681,6 +765,7 @@ public final class BrowserSearchViewModel: ObservableObject {
         client: BrowserVersionSearching,
         installer: BrowserVersionInstalling? = nil,
         lister: InstalledBrowserListing? = nil,
+        mobilePresetLister: MobilePresetListing? = nil,
         sessionOpener: ManualSessionOpening? = nil,
         disabler: InstalledBrowserDisabling? = nil,
         uninstaller: InstalledBrowserUninstalling? = nil,
@@ -691,6 +776,7 @@ public final class BrowserSearchViewModel: ObservableObject {
         self.client = client
         self.installer = installer
         self.lister = lister
+        self.mobilePresetLister = mobilePresetLister
         self.sessionOpener = sessionOpener
         self.disabler = disabler
         self.uninstaller = uninstaller
@@ -721,6 +807,15 @@ public final class BrowserSearchViewModel: ObservableObject {
         guard let lister else { return }
         do {
             installedRows = try await lister.listInstalledBrowsers().browsers.map(Self.installedRow)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func refreshMobilePresets() async {
+        guard let mobilePresetLister else { return }
+        do {
+            mobilePresets = try await mobilePresetLister.listMobilePresets().presets
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -765,10 +860,12 @@ public final class BrowserSearchViewModel: ObservableObject {
         defer { openingImageTag = nil }
 
         let trimmedURL = targetURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPresetID = selectedMobilePresetID.trimmingCharacters(in: .whitespacesAndNewlines)
         do {
             activeSession = try await sessionOpener.openManualSession(
                 browser: record,
-                url: trimmedURL.isEmpty ? nil : trimmedURL
+                url: trimmedURL.isEmpty ? nil : trimmedURL,
+                mobilePresetID: trimmedPresetID.isEmpty ? nil : trimmedPresetID
             )
             await refreshActiveSessions()
         } catch {
@@ -899,6 +996,9 @@ public final class BrowserSearchViewModel: ObservableObject {
         if let title = session.title, !title.isEmpty {
             detail.append("Title: \(title)")
         }
+        if let mobileEmulation = session.mobileEmulation, !mobileEmulation.presetId.isEmpty {
+            detail.append("Mobile: \(mobileEmulation.name)")
+        }
         return ActiveSessionRow(
             id: session.sessionId,
             title: "Session \(session.sessionId)",
@@ -919,11 +1019,11 @@ public final class BrowserSearchViewModel: ObservableObject {
             "Screenshot: \(artifact.screenshotPath)",
             "Metadata: \(artifact.metadataPath)",
             "Summary: \(artifact.summaryPath)"
-        ].joined(separator: "\n")
+        ] + (artifact.mobileEmulation.map { ["Mobile: \($0.name)"] } ?? [])
         return ScreenshotArtifactRow(
             id: artifact.screenshotPath,
             title: "\(browserName) \(artifact.browserVersion) - \(artifact.capturedAt)",
-            detail: details,
+            detail: details.joined(separator: "\n"),
             screenshotURL: URL(fileURLWithPath: artifact.screenshotPath),
             artifact: artifact
         )
@@ -990,6 +1090,12 @@ public struct BrowserSearchView: View {
                     .font(.headline)
                 TextField("URL", text: $viewModel.targetURL)
                     .textFieldStyle(.roundedBorder)
+                Picker("Mobile", selection: $viewModel.selectedMobilePresetID) {
+                    Text("Desktop").tag("")
+                    ForEach(viewModel.mobilePresets) { preset in
+                        Text(preset.name).tag(preset.id)
+                    }
+                }
                 Toggle("Delete Docker image", isOn: $viewModel.deleteImageOnUninstall)
                 Toggle("Confirm image deletion", isOn: $viewModel.confirmDeleteImage)
                     .disabled(!viewModel.deleteImageOnUninstall)
@@ -1115,6 +1221,7 @@ public struct BrowserSearchView: View {
             }
         }
         .task {
+            await viewModel.refreshMobilePresets()
             await viewModel.refreshInstalledBrowsers()
             await viewModel.refreshActiveSessions()
         }

@@ -184,6 +184,51 @@ func TestBrowserSearchEndpointReturnsNormalizedChromeResults(t *testing.T) {
 	}
 }
 
+func TestMobilePresetCatalogEndpointReturnsChromePresets(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport: appSupport,
+	}))
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequest(http.MethodGet, server.URL+"/v1/mobile-presets", nil)
+	if err != nil {
+		t.Fatalf("NewRequest() error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+appSupport.Token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /v1/mobile-presets error = %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/mobile-presets status = %d, want 200", resp.StatusCode)
+	}
+	var catalog MobilePresetCatalogResponse
+	if err := json.NewDecoder(resp.Body).Decode(&catalog); err != nil {
+		t.Fatalf("decode mobile preset catalog: %v", err)
+	}
+	if len(catalog.Presets) < 2 {
+		t.Fatalf("presets = %+v, want small Chrome mobile preset catalog", catalog.Presets)
+	}
+	var found bool
+	for _, preset := range catalog.Presets {
+		if preset.ID == "iphone-14" && preset.DeviceMetrics.Width == 390 && preset.UserAgent != "" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("presets = %+v, want iphone-14 with metrics and user agent", catalog.Presets)
+	}
+}
+
 func TestBrowserInstallEndpointPullsExactSeleniumImageAndListsInstalledBrowser(t *testing.T) {
 	t.Setenv("BROWSERLAB_HOME", t.TempDir())
 	appSupport, err := config.EnsureAppSupport()

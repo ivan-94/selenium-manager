@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/artifact"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/emulation"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
 )
@@ -23,6 +24,7 @@ type CreateRequest struct {
 	BrowserName    string `json:"browserName"`
 	BrowserVersion string `json:"browserVersion"`
 	URL            string `json:"url,omitempty"`
+	MobilePresetID string `json:"mobilePresetId,omitempty"`
 }
 
 type Status string
@@ -34,17 +36,18 @@ const (
 )
 
 type Record struct {
-	SessionID         string          `json:"sessionId"`
-	BrowserName       string          `json:"browserName"`
-	BrowserVersion    string          `json:"browserVersion"`
-	RequestedURL      string          `json:"requestedUrl"`
-	CurrentURL        string          `json:"currentUrl,omitempty"`
-	Title             string          `json:"title,omitempty"`
-	GridURL           string          `json:"gridUrl"`
-	WebDriverEndpoint string          `json:"webdriverEndpoint"`
-	NoVNC             NoVNCResolution `json:"noVnc"`
-	StartedAt         string          `json:"startedAt"`
-	Status            Status          `json:"status"`
+	SessionID         string              `json:"sessionId"`
+	BrowserName       string              `json:"browserName"`
+	BrowserVersion    string              `json:"browserVersion"`
+	RequestedURL      string              `json:"requestedUrl"`
+	CurrentURL        string              `json:"currentUrl,omitempty"`
+	Title             string              `json:"title,omitempty"`
+	GridURL           string              `json:"gridUrl"`
+	WebDriverEndpoint string              `json:"webdriverEndpoint"`
+	NoVNC             NoVNCResolution     `json:"noVnc"`
+	MobileEmulation   emulation.Selection `json:"mobileEmulation,omitempty"`
+	StartedAt         string              `json:"startedAt"`
+	Status            Status              `json:"status"`
 }
 
 type CreateResponse = Record
@@ -65,6 +68,7 @@ type CaptureSessionRequest struct {
 	CurrentURL        string `json:"currentUrl,omitempty"`
 	Title             string `json:"title,omitempty"`
 	WebDriverEndpoint string `json:"webdriverEndpoint"`
+	MobilePresetID    string `json:"mobilePresetId,omitempty"`
 }
 
 type ScreenshotResult = artifact.ScreenshotResult
@@ -217,9 +221,13 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 	if client == nil {
 		client = HTTPWebDriverClient{Client: http.DefaultClient}
 	}
+	capabilities, selectedMobileEmulation, err := BuildCapabilitiesWithMobilePreset(installedRecord, request.MobilePresetID)
+	if err != nil {
+		return CreateResponse{}, err
+	}
 	newSession, err := client.NewSession(ctx, NewSessionRequest{
 		WebDriverEndpoint: gridStatus.WebDriverEndpoint,
-		Capabilities:      BuildCapabilities(installedRecord),
+		Capabilities:      capabilities,
 	})
 	if err != nil {
 		return CreateResponse{}, Problem{Code: "webdriver_session_failed", Message: err.Error()}
@@ -246,6 +254,7 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 		GridURL:           gridStatus.GridURL,
 		WebDriverEndpoint: gridStatus.WebDriverEndpoint,
 		NoVNC:             ResolveNoVNC(gridStatus.GridURL, newSession.SessionID, newSession.Capabilities),
+		MobileEmulation:   selectedMobileEmulation,
 		StartedAt:         startedAt,
 		Status:            StatusActive,
 	}
@@ -345,6 +354,10 @@ func (manager Manager) CaptureSessionScreenshot(ctx context.Context, request Cap
 	if request.BrowserVersion == "" {
 		return ScreenshotResult{}, Problem{Code: "invalid_screenshot_request", Message: "browserVersion is required"}
 	}
+	selectedMobileEmulation, err := selectMobileEmulation(request.MobilePresetID)
+	if err != nil {
+		return ScreenshotResult{}, err
+	}
 
 	client := manager.webDriverClient()
 	currentURL := request.CurrentURL
@@ -360,16 +373,17 @@ func (manager Manager) CaptureSessionScreenshot(ctx context.Context, request Cap
 		return ScreenshotResult{}, Problem{Code: "screenshot_failed", Message: err.Error()}
 	}
 	return manager.artifactStore().WriteScreenshot(artifact.ScreenshotInput{
-		GroupType:      "session",
-		GroupID:        request.SessionID,
-		SessionID:      request.SessionID,
-		BrowserName:    request.BrowserName,
-		BrowserVersion: request.BrowserVersion,
-		RequestedURL:   request.RequestedURL,
-		CurrentURL:     currentURL,
-		Title:          title,
-		CapturedAt:     manager.now(),
-		PNG:            png,
+		GroupType:       "session",
+		GroupID:         request.SessionID,
+		SessionID:       request.SessionID,
+		BrowserName:     request.BrowserName,
+		BrowserVersion:  request.BrowserVersion,
+		RequestedURL:    request.RequestedURL,
+		CurrentURL:      currentURL,
+		Title:           title,
+		MobileEmulation: selectedMobileEmulation,
+		CapturedAt:      manager.now(),
+		PNG:             png,
 	})
 }
 
@@ -405,9 +419,13 @@ func (manager Manager) CaptureScreenshotRun(ctx context.Context, request CreateR
 	}
 
 	client := manager.webDriverClient()
+	capabilities, selectedMobileEmulation, err := BuildScreenshotCapabilitiesWithMobilePreset(record, request.MobilePresetID)
+	if err != nil {
+		return ScreenshotResult{}, err
+	}
 	newSession, err := client.NewSession(ctx, NewSessionRequest{
 		WebDriverEndpoint: gridStatus.WebDriverEndpoint,
-		Capabilities:      BuildScreenshotCapabilities(record),
+		Capabilities:      capabilities,
 	})
 	if err != nil {
 		return ScreenshotResult{}, Problem{Code: "webdriver_session_failed", Message: err.Error()}
@@ -432,39 +450,90 @@ func (manager Manager) CaptureScreenshotRun(ctx context.Context, request CreateR
 	capturedAt := manager.now()
 	runID := fmt.Sprintf("run-%s-%s-%s", capturedAt.UTC().Format("20060102T150405Z"), request.BrowserName, request.BrowserVersion)
 	return manager.artifactStore().WriteScreenshot(artifact.ScreenshotInput{
-		GroupType:      "run",
-		GroupID:        runID,
-		RunID:          runID,
-		SessionID:      newSession.SessionID,
-		BrowserName:    record.Family,
-		BrowserVersion: record.Version,
-		RequestedURL:   request.URL,
-		CurrentURL:     currentURL,
-		Title:          title,
-		CapturedAt:     capturedAt,
-		PNG:            png,
+		GroupType:       "run",
+		GroupID:         runID,
+		RunID:           runID,
+		SessionID:       newSession.SessionID,
+		BrowserName:     record.Family,
+		BrowserVersion:  record.Version,
+		RequestedURL:    request.URL,
+		CurrentURL:      currentURL,
+		Title:           title,
+		MobileEmulation: selectedMobileEmulation,
+		CapturedAt:      capturedAt,
+		PNG:             png,
 	})
 }
 
 func BuildCapabilities(record registry.BrowserRecord) map[string]any {
+	capabilities, _, _ := BuildCapabilitiesWithMobilePreset(record, "")
+	return capabilities
+}
+
+func BuildCapabilitiesWithMobilePreset(record registry.BrowserRecord, mobilePresetID string) (map[string]any, emulation.Selection, error) {
 	family := strings.ToLower(strings.TrimSpace(record.Family))
 	version := strings.TrimSpace(record.Version)
-	return map[string]any{
+	capabilities := map[string]any{
 		"browserName":            family,
 		"browserVersion":         version,
 		"platformName":           platformName(record.Platform),
 		"se:name":                "BrowserLab manual " + family + " " + version,
 		"browserlab:sessionType": "manual",
 	}
+	selected, err := applyMobilePreset(capabilities, family, mobilePresetID)
+	if err != nil {
+		return nil, emulation.Selection{}, err
+	}
+	return capabilities, selected, nil
 }
 
 func BuildScreenshotCapabilities(record registry.BrowserRecord) map[string]any {
-	capabilities := BuildCapabilities(record)
+	capabilities, _, _ := BuildScreenshotCapabilitiesWithMobilePreset(record, "")
+	return capabilities
+}
+
+func BuildScreenshotCapabilitiesWithMobilePreset(record registry.BrowserRecord, mobilePresetID string) (map[string]any, emulation.Selection, error) {
+	capabilities, selected, err := BuildCapabilitiesWithMobilePreset(record, mobilePresetID)
+	if err != nil {
+		return nil, emulation.Selection{}, err
+	}
 	family := strings.ToLower(strings.TrimSpace(record.Family))
 	version := strings.TrimSpace(record.Version)
 	capabilities["se:name"] = "BrowserLab screenshot " + family + " " + version
 	capabilities["browserlab:sessionType"] = "screenshot"
-	return capabilities
+	return capabilities, selected, nil
+}
+
+func applyMobilePreset(capabilities map[string]any, family string, mobilePresetID string) (emulation.Selection, error) {
+	selected, err := selectMobileEmulation(mobilePresetID)
+	if err != nil {
+		return emulation.Selection{}, err
+	}
+	if selected.PresetID == "" {
+		return selected, nil
+	}
+	if family != "chrome" {
+		return emulation.Selection{}, Problem{Code: "invalid_mobile_preset", Message: "Chrome mobile emulation presets only support Chrome"}
+	}
+	capabilities["goog:chromeOptions"] = map[string]any{
+		"mobileEmulation": map[string]any{
+			"deviceMetrics": map[string]any{
+				"width":      selected.DeviceMetrics.Width,
+				"height":     selected.DeviceMetrics.Height,
+				"pixelRatio": selected.DeviceMetrics.PixelRatio,
+			},
+			"userAgent": selected.UserAgent,
+		},
+	}
+	return selected, nil
+}
+
+func selectMobileEmulation(mobilePresetID string) (emulation.Selection, error) {
+	selected, err := emulation.Select(mobilePresetID)
+	if err == nil {
+		return selected, nil
+	}
+	return emulation.Selection{}, Problem{Code: "invalid_mobile_preset", Message: err.Error()}
 }
 
 func ResolveNoVNC(gridURL string, sessionID string, capabilities map[string]any) NoVNCResolution {
@@ -688,6 +757,7 @@ func normalizeCreateRequest(request CreateRequest) CreateRequest {
 	request.BrowserName = strings.ToLower(strings.TrimSpace(request.BrowserName))
 	request.BrowserVersion = strings.TrimSpace(request.BrowserVersion)
 	request.URL = strings.TrimSpace(request.URL)
+	request.MobilePresetID = emulation.NormalizeID(request.MobilePresetID)
 	return request
 }
 
@@ -699,6 +769,7 @@ func normalizeCaptureSessionRequest(request CaptureSessionRequest) CaptureSessio
 	request.CurrentURL = strings.TrimSpace(request.CurrentURL)
 	request.Title = strings.TrimSpace(request.Title)
 	request.WebDriverEndpoint = strings.TrimSpace(request.WebDriverEndpoint)
+	request.MobilePresetID = emulation.NormalizeID(request.MobilePresetID)
 	return request
 }
 

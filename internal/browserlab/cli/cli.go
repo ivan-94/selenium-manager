@@ -76,10 +76,10 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "       browserlab browsers disable --image-tag TAG [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab browsers uninstall --image-tag TAG [--delete-image --confirm-delete-image] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab grid <start|stop|status|config> [--json] [--base-url URL]")
-	fmt.Fprintln(w, "       browserlab session open chrome VERSION [URL] [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab session open chrome VERSION [URL] [--mobile-preset ID] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab sessions <list|inspect|close> [SESSION_ID] [--json] [--base-url URL]")
-	fmt.Fprintln(w, "       browserlab session screenshot SESSION_ID --browser chrome --version VERSION --webdriver-endpoint URL [--json] [--base-url URL]")
-	fmt.Fprintln(w, "       browserlab screenshot chrome VERSION URL [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab session screenshot SESSION_ID --browser chrome --version VERSION --webdriver-endpoint URL [--mobile-preset ID] [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab screenshot chrome VERSION URL [--mobile-preset ID] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
 }
 
@@ -336,6 +336,7 @@ func runSessionOpen(args []string, stdout io.Writer, stderr io.Writer) int {
 		BrowserName:    parsed.browser,
 		BrowserVersion: parsed.version,
 		URL:            parsed.url,
+		MobilePresetID: parsed.mobilePresetID,
 	})
 	if err != nil {
 		code, message := problemDetails(err, "session_failed")
@@ -452,6 +453,7 @@ func runSessionScreenshot(args []string, stdout io.Writer, stderr io.Writer) int
 		BrowserVersion:    parsed.version,
 		RequestedURL:      parsed.requestedURL,
 		WebDriverEndpoint: parsed.webDriverEndpoint,
+		MobilePresetID:    parsed.mobilePresetID,
 	})
 	if err != nil {
 		writeProblem(stdout, parsed.jsonOutput, "screenshot_failed", err.Error())
@@ -486,6 +488,7 @@ func runScreenshot(args []string, stdout io.Writer, stderr io.Writer) int {
 		BrowserName:    parsed.browser,
 		BrowserVersion: parsed.version,
 		URL:            parsed.url,
+		MobilePresetID: parsed.mobilePresetID,
 	})
 	if err != nil {
 		writeProblem(stdout, parsed.jsonOutput, "screenshot_failed", err.Error())
@@ -1121,11 +1124,12 @@ type installArgs struct {
 }
 
 type sessionOpenArgs struct {
-	browser    string
-	version    string
-	url        string
-	jsonOutput bool
-	baseURL    string
+	browser        string
+	version        string
+	url            string
+	mobilePresetID string
+	jsonOutput     bool
+	baseURL        string
 }
 
 type sessionsArgs struct {
@@ -1162,16 +1166,18 @@ type sessionScreenshotArgs struct {
 	version           string
 	requestedURL      string
 	webDriverEndpoint string
+	mobilePresetID    string
 	jsonOutput        bool
 	baseURL           string
 }
 
 type screenshotRunArgs struct {
-	browser    string
-	version    string
-	url        string
-	jsonOutput bool
-	baseURL    string
+	browser        string
+	version        string
+	url            string
+	mobilePresetID string
+	jsonOutput     bool
+	baseURL        string
 }
 
 func parseSessionScreenshotArgs(args []string) (sessionScreenshotArgs, error) {
@@ -1211,6 +1217,12 @@ func parseSessionScreenshotArgs(args []string) (sessionScreenshotArgs, error) {
 			}
 			parsed.webDriverEndpoint = args[i+1]
 			i++
+		case "--mobile-preset":
+			if i+1 >= len(args) {
+				return sessionScreenshotArgs{}, fmt.Errorf("--mobile-preset requires a preset ID")
+			}
+			parsed.mobilePresetID = args[i+1]
+			i++
 		default:
 			if strings.HasPrefix(args[i], "-") {
 				return sessionScreenshotArgs{}, fmt.Errorf("unknown flag: %s", args[i])
@@ -1247,6 +1259,12 @@ func parseScreenshotRunArgs(args []string) (screenshotRunArgs, error) {
 			}
 			parsed.baseURL = args[i+1]
 			i++
+		case "--mobile-preset":
+			if i+1 >= len(args) {
+				return screenshotRunArgs{}, fmt.Errorf("--mobile-preset requires a preset ID")
+			}
+			parsed.mobilePresetID = args[i+1]
+			i++
 		default:
 			if strings.HasPrefix(args[i], "-") {
 				return screenshotRunArgs{}, fmt.Errorf("unknown flag: %s", args[i])
@@ -1278,6 +1296,12 @@ func parseSessionOpenArgs(args []string) (sessionOpenArgs, error) {
 				return sessionOpenArgs{}, fmt.Errorf("--base-url requires a URL")
 			}
 			parsed.baseURL = args[i+1]
+			i++
+		case "--mobile-preset":
+			if i+1 >= len(args) {
+				return sessionOpenArgs{}, fmt.Errorf("--mobile-preset requires a preset ID")
+			}
+			parsed.mobilePresetID = args[i+1]
 			i++
 		default:
 			if strings.HasPrefix(args[i], "-") {
@@ -1510,6 +1534,9 @@ func writeGridStatusHuman(stdout io.Writer, status grid.Status) {
 func writeManualSessionHuman(stdout io.Writer, result api.ManualSessionResponse) {
 	fmt.Fprintf(stdout, "Manual session: %s\n", result.SessionID)
 	fmt.Fprintf(stdout, "Browser: %s %s\n", displayBrowserName(result.BrowserName), result.BrowserVersion)
+	if result.MobileEmulation.PresetID != "" {
+		fmt.Fprintf(stdout, "Mobile preset: %s (%s)\n", result.MobileEmulation.PresetID, result.MobileEmulation.Name)
+	}
 	fmt.Fprintf(stdout, "Requested URL: %s\n", result.RequestedURL)
 	if result.CurrentURL != "" {
 		fmt.Fprintf(stdout, "Current URL: %s\n", result.CurrentURL)
@@ -1540,6 +1567,9 @@ func writeSessionsHuman(stdout io.Writer, list api.SessionListResponse) {
 func writeSessionRecordHuman(stdout io.Writer, session api.ManualSessionResponse) {
 	fmt.Fprintf(stdout, "Session: %s (%s)\n", session.SessionID, session.Status)
 	fmt.Fprintf(stdout, "Browser: %s %s\n", displayBrowserName(session.BrowserName), session.BrowserVersion)
+	if session.MobileEmulation.PresetID != "" {
+		fmt.Fprintf(stdout, "Mobile preset: %s (%s)\n", session.MobileEmulation.PresetID, session.MobileEmulation.Name)
+	}
 	fmt.Fprintf(stdout, "Started: %s\n", session.StartedAt)
 	if session.CurrentURL != "" {
 		fmt.Fprintf(stdout, "Current URL: %s\n", session.CurrentURL)
@@ -1562,6 +1592,9 @@ func writeScreenshotHuman(stdout io.Writer, result api.ScreenshotResponse) {
 	}
 	if result.RunID != "" {
 		fmt.Fprintf(stdout, "Run: %s\n", result.RunID)
+	}
+	if result.MobileEmulation.PresetID != "" {
+		fmt.Fprintf(stdout, "Mobile preset: %s (%s)\n", result.MobileEmulation.PresetID, result.MobileEmulation.Name)
 	}
 	fmt.Fprintf(stdout, "Screenshot: %s\n", result.ScreenshotPath)
 	fmt.Fprintf(stdout, "Metadata: %s\n", result.MetadataPath)

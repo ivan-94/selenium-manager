@@ -145,9 +145,74 @@ final class BrowserSearchViewModelTests: XCTestCase {
         let activeSession = await viewModel.activeSession
         let activeNoVNCURL = await viewModel.activeNoVNCURL
         XCTAssertEqual(opener.requestedURL, nil)
+        XCTAssertEqual(opener.requestedMobilePresetID, nil)
         XCTAssertEqual(activeSession?.sessionId, "session-123")
         XCTAssertEqual(activeSession?.requestedUrl, "about:blank")
         XCTAssertEqual(activeNoVNCURL?.absoluteString, "http://127.0.0.1:4444/ui/#/sessions/session-123")
+    }
+
+    func testOpenManualSessionPassesSelectedMobilePreset() async {
+        let imageTag = "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+        let installed = InstalledBrowserRecord(
+            family: "chrome",
+            version: "119.0",
+            imageTag: imageTag,
+            platform: "linux/amd64",
+            source: "selenium-dockerhub",
+            enabled: true
+        )
+        let mobileEmulation = MobileEmulation(
+            presetId: "iphone-14",
+            name: "iPhone 14",
+            deviceMetrics: .init(width: 390, height: 844, pixelRatio: 3),
+            userAgent: "mobile safari"
+        )
+        let opener = FakeManualSessionOpener(response: .success(.init(
+            sessionId: "session-123",
+            browserName: "chrome",
+            browserVersion: "119.0",
+            requestedUrl: "about:blank",
+            currentUrl: "about:blank",
+            title: nil,
+            gridUrl: "http://127.0.0.1:4444",
+            webdriverEndpoint: "http://127.0.0.1:4444/wd/hub",
+            noVnc: .init(url: nil, vncWebSocketUrl: nil, vncLocalAddress: nil, gridSessionUrl: nil),
+            mobileEmulation: mobileEmulation,
+            startedAt: "2026-05-20T10:30:00Z"
+        )))
+        let presets = FakeMobilePresetLister(response: .success(.init(presets: [
+            .init(
+                id: "iphone-14",
+                name: "iPhone 14",
+                deviceMetrics: .init(width: 390, height: 844, pixelRatio: 3),
+                userAgent: "mobile safari"
+            )
+        ])))
+        let manager = FakeBrowserManager(
+            searchResponse: .success(.init(browser: "chrome", query: "", results: [])),
+            installResponse: .failure(NSError(domain: "BrowserLab", code: 1)),
+            installedResponse: .success(.init(browsers: [installed]))
+        )
+        let viewModel = await BrowserSearchViewModel(
+            client: manager,
+            lister: manager,
+            mobilePresetLister: presets,
+            sessionOpener: opener
+        )
+
+        await viewModel.refreshMobilePresets()
+        await viewModel.refreshInstalledBrowsers()
+        await MainActor.run {
+            viewModel.selectedMobilePresetID = "iphone-14"
+        }
+        let rows = await viewModel.installedRows
+        await viewModel.openManualSession(record: rows[0].record)
+
+        let activeSession = await viewModel.activeSession
+        let loadedPresets = await viewModel.mobilePresets
+        XCTAssertEqual(loadedPresets.map(\.id), ["iphone-14"])
+        XCTAssertEqual(opener.requestedMobilePresetID, "iphone-14")
+        XCTAssertEqual(activeSession?.mobileEmulation?.presetId, "iphone-14")
     }
 
     func testDisableInstalledBrowserRefreshesRowsAndShowsMessage() async {
@@ -350,6 +415,14 @@ private struct FakeBrowserSearchClient: BrowserVersionSearching {
     }
 }
 
+private struct FakeMobilePresetLister: MobilePresetListing {
+    let response: Result<MobilePresetCatalogResponse, Error>
+
+    func listMobilePresets() async throws -> MobilePresetCatalogResponse {
+        try response.get()
+    }
+}
+
 private final class FakeBrowserManager: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, InstalledBrowserDisabling, InstalledBrowserUninstalling {
     let searchResponse: Result<BrowserSearchResponse, Error>
     let installResponse: Result<BrowserInstallResponse, Error>
@@ -399,14 +472,16 @@ private final class FakeManualSessionOpener: ManualSessionOpening {
     let response: Result<ManualSessionResponse, Error>
     private(set) var requestedBrowser: InstalledBrowserRecord?
     private(set) var requestedURL: String?
+    private(set) var requestedMobilePresetID: String?
 
     init(response: Result<ManualSessionResponse, Error>) {
         self.response = response
     }
 
-    func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse {
+    func openManualSession(browser: InstalledBrowserRecord, url: String?, mobilePresetID: String?) async throws -> ManualSessionResponse {
         requestedBrowser = browser
         requestedURL = url
+        requestedMobilePresetID = mobilePresetID
         return try response.get()
     }
 }
