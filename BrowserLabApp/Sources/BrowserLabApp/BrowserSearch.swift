@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import WebKit
 
 public struct BrowserSearchResponse: Decodable, Equatable {
     public let browser: String
@@ -134,7 +135,62 @@ public protocol InstalledBrowserListing {
     func listInstalledBrowsers() async throws -> InstalledBrowsersResponse
 }
 
-public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing {
+public struct NoVNCResolution: Decodable, Equatable {
+    public let url: String?
+    public let vncWebSocketUrl: String?
+    public let vncLocalAddress: String?
+    public let gridSessionUrl: String?
+
+    public init(url: String?, vncWebSocketUrl: String?, vncLocalAddress: String?, gridSessionUrl: String?) {
+        self.url = url
+        self.vncWebSocketUrl = vncWebSocketUrl
+        self.vncLocalAddress = vncLocalAddress
+        self.gridSessionUrl = gridSessionUrl
+    }
+}
+
+public struct ManualSessionResponse: Decodable, Equatable {
+    public let sessionId: String
+    public let browserName: String
+    public let browserVersion: String
+    public let requestedUrl: String
+    public let currentUrl: String?
+    public let title: String?
+    public let gridUrl: String
+    public let webdriverEndpoint: String
+    public let noVnc: NoVNCResolution
+    public let startedAt: String
+
+    public init(
+        sessionId: String,
+        browserName: String,
+        browserVersion: String,
+        requestedUrl: String,
+        currentUrl: String?,
+        title: String?,
+        gridUrl: String,
+        webdriverEndpoint: String,
+        noVnc: NoVNCResolution,
+        startedAt: String
+    ) {
+        self.sessionId = sessionId
+        self.browserName = browserName
+        self.browserVersion = browserVersion
+        self.requestedUrl = requestedUrl
+        self.currentUrl = currentUrl
+        self.title = title
+        self.gridUrl = gridUrl
+        self.webdriverEndpoint = webdriverEndpoint
+        self.noVnc = noVnc
+        self.startedAt = startedAt
+    }
+}
+
+public protocol ManualSessionOpening {
+    func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse
+}
+
+public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening {
     private let baseURL: URL
     private let tokenFile: URL
     private let session: URLSession
@@ -226,6 +282,30 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
         return try JSONDecoder().decode(InstalledBrowsersResponse.self, from: data)
     }
 
+    public func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse {
+        let token = try readToken()
+        let body = ManualSessionRequest(browser: browser, url: url)
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1")
+                .appendingPathComponent("sessions")
+                .appendingPathComponent("manual")
+        )
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(body)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw DaemonStatusClientError.badHTTPStatus(-1)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw DaemonStatusClientError.badHTTPStatus(httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(ManualSessionResponse.self, from: data)
+    }
+
     private func readToken() throws -> String {
         do {
             return try String(contentsOf: tokenFile, encoding: .utf8)
@@ -254,6 +334,18 @@ private struct BrowserInstallRequest: Encodable {
     }
 }
 
+private struct ManualSessionRequest: Encodable {
+    let browserName: String
+    let browserVersion: String
+    let url: String?
+
+    init(browser: InstalledBrowserRecord, url: String?) {
+        browserName = browser.family
+        browserVersion = browser.version
+        self.url = url
+    }
+}
+
 public struct BrowserSearchRow: Equatable, Identifiable {
     public let id: String
     public let title: String
@@ -267,6 +359,7 @@ public struct InstalledBrowserRow: Equatable, Identifiable {
     public let title: String
     public let detail: String
     public let enabled: Bool
+    public let record: InstalledBrowserRecord
 }
 
 @MainActor
@@ -276,21 +369,27 @@ public final class BrowserSearchViewModel: ObservableObject {
     @Published public private(set) var installedRows: [InstalledBrowserRow] = []
     @Published public private(set) var isSearching: Bool = false
     @Published public private(set) var installingImageTag: String?
+    @Published public private(set) var openingImageTag: String?
+    @Published public var targetURL: String = ""
+    @Published public private(set) var activeSession: ManualSessionResponse?
     @Published public private(set) var installMessages: [String: String] = [:]
     @Published public private(set) var errorMessage: String?
 
     private let client: BrowserVersionSearching
     private let installer: BrowserVersionInstalling?
     private let lister: InstalledBrowserListing?
+    private let sessionOpener: ManualSessionOpening?
 
     public init(
         client: BrowserVersionSearching,
         installer: BrowserVersionInstalling? = nil,
-        lister: InstalledBrowserListing? = nil
+        lister: InstalledBrowserListing? = nil,
+        sessionOpener: ManualSessionOpening? = nil
     ) {
         self.client = client
         self.installer = installer
         self.lister = lister
+        self.sessionOpener = sessionOpener
     }
 
     public func search(query: String? = nil) async {
@@ -343,6 +442,28 @@ public final class BrowserSearchViewModel: ObservableObject {
         }
     }
 
+    public func openManualSession(record: InstalledBrowserRecord) async {
+        guard let sessionOpener else { return }
+        openingImageTag = record.imageTag
+        errorMessage = nil
+        defer { openingImageTag = nil }
+
+        let trimmedURL = targetURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            activeSession = try await sessionOpener.openManualSession(
+                browser: record,
+                url: trimmedURL.isEmpty ? nil : trimmedURL
+            )
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public var activeNoVNCURL: URL? {
+        guard let raw = activeSession?.noVnc.url else { return nil }
+        return URL(string: raw)
+    }
+
     private static func row(for result: BrowserSearchResult) -> BrowserSearchRow {
         var details = ["Image: \(result.imageTag)"]
         var metadata: [String] = []
@@ -383,7 +504,8 @@ public final class BrowserSearchViewModel: ObservableObject {
                 "Platform: \(record.platform)",
                 "Source: \(record.source)"
             ].joined(separator: "\n"),
-            enabled: record.enabled
+            enabled: record.enabled,
+            record: record
         )
     }
 }
@@ -446,10 +568,21 @@ public struct BrowserSearchView: View {
             if !viewModel.installedRows.isEmpty {
                 Text("Installed Browsers")
                     .font(.headline)
+                TextField("URL", text: $viewModel.targetURL)
+                    .textFieldStyle(.roundedBorder)
                 List(viewModel.installedRows) { row in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(row.title)
-                            .font(.headline)
+                        HStack {
+                            Text(row.title)
+                                .font(.headline)
+                            Spacer()
+                            Button(viewModel.openingImageTag == row.id ? "Opening" : "Open") {
+                                Task {
+                                    await viewModel.openManualSession(record: row.record)
+                                }
+                            }
+                            .disabled(viewModel.openingImageTag == row.id)
+                        }
                         Text(row.detail)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -459,9 +592,49 @@ public struct BrowserSearchView: View {
                 }
                 .frame(minHeight: 120)
             }
+            if let session = viewModel.activeSession {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Session \(session.sessionId)")
+                            .font(.headline)
+                        Spacer()
+                        if let url = viewModel.activeNoVNCURL {
+                            Link("Open External", destination: url)
+                        }
+                    }
+                    if let currentURL = session.currentUrl, !currentURL.isEmpty {
+                        Text(currentURL)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    if let url = viewModel.activeNoVNCURL {
+                        NoVNCWebView(url: url)
+                            .frame(minHeight: 260)
+                    }
+                }
+            }
         }
         .task {
             await viewModel.refreshInstalledBrowsers()
+        }
+    }
+}
+
+public struct NoVNCWebView: NSViewRepresentable {
+    public let url: URL
+
+    public init(url: URL) {
+        self.url = url
+    }
+
+    public func makeNSView(context: Context) -> WKWebView {
+        WKWebView()
+    }
+
+    public func updateNSView(_ webView: WKWebView, context: Context) {
+        if webView.url != url {
+            webView.load(URLRequest(url: url))
         }
     }
 }

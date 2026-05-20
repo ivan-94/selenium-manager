@@ -99,6 +99,55 @@ final class BrowserSearchViewModelTests: XCTestCase {
         let installMessages = await viewModel.installMessages
         XCTAssertTrue(installMessages[result.imageTag]?.contains("pull_failed") == true)
     }
+
+    func testOpenManualSessionDefaultsBlankURLAndExposesNoVNCURL() async {
+        let installed = InstalledBrowserRecord(
+            family: "chrome",
+            version: "119.0",
+            imageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+            platform: "linux/amd64",
+            source: "selenium-dockerhub",
+            enabled: true
+        )
+        let opener = FakeManualSessionOpener(response: .success(.init(
+            sessionId: "session-123",
+            browserName: "chrome",
+            browserVersion: "119.0",
+            requestedUrl: "about:blank",
+            currentUrl: "about:blank",
+            title: nil,
+            gridUrl: "http://127.0.0.1:4444",
+            webdriverEndpoint: "http://127.0.0.1:4444/wd/hub",
+            noVnc: .init(
+                url: "http://127.0.0.1:4444/ui/#/sessions/session-123",
+                vncWebSocketUrl: "ws://127.0.0.1:4444/session/session-123/se/vnc",
+                vncLocalAddress: nil,
+                gridSessionUrl: "http://127.0.0.1:4444/ui/#/sessions/session-123"
+            ),
+            startedAt: "2026-05-20T10:30:00Z"
+        )))
+        let manager = FakeBrowserManager(
+            searchResponse: .success(.init(browser: "chrome", query: "", results: [])),
+            installResponse: .failure(NSError(domain: "BrowserLab", code: 1)),
+            installedResponse: .success(.init(browsers: [installed]))
+        )
+        let viewModel = await BrowserSearchViewModel(
+            client: manager,
+            lister: manager,
+            sessionOpener: opener
+        )
+
+        await viewModel.refreshInstalledBrowsers()
+        let rows = await viewModel.installedRows
+        await viewModel.openManualSession(record: rows[0].record)
+
+        let activeSession = await viewModel.activeSession
+        let activeNoVNCURL = await viewModel.activeNoVNCURL
+        XCTAssertEqual(opener.requestedURL, nil)
+        XCTAssertEqual(activeSession?.sessionId, "session-123")
+        XCTAssertEqual(activeSession?.requestedUrl, "about:blank")
+        XCTAssertEqual(activeNoVNCURL?.absoluteString, "http://127.0.0.1:4444/ui/#/sessions/session-123")
+    }
 }
 
 private struct FakeBrowserSearchClient: BrowserVersionSearching {
@@ -124,5 +173,21 @@ private struct FakeBrowserManager: BrowserVersionSearching, BrowserVersionInstal
 
     func listInstalledBrowsers() async throws -> InstalledBrowsersResponse {
         try installedResponse.get()
+    }
+}
+
+private final class FakeManualSessionOpener: ManualSessionOpening {
+    let response: Result<ManualSessionResponse, Error>
+    private(set) var requestedBrowser: InstalledBrowserRecord?
+    private(set) var requestedURL: String?
+
+    init(response: Result<ManualSessionResponse, Error>) {
+        self.response = response
+    }
+
+    func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse {
+        requestedBrowser = browser
+        requestedURL = url
+        return try response.get()
     }
 }

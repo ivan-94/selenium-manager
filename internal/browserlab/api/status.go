@@ -16,6 +16,7 @@ import (
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
+	browserlabsession "github.com/ivan-94/selenium-manager/internal/browserlab/session"
 )
 
 const DefaultListenAddr = "127.0.0.1:49321"
@@ -28,6 +29,7 @@ type ServerOptions struct {
 	CatalogSource    catalog.TagSource
 	ImagePuller      install.ImagePuller
 	GridRunner       grid.RuntimeRunner
+	WebDriverClient  browserlabsession.WebDriverClient
 	HostArchitecture string
 }
 
@@ -85,6 +87,9 @@ type GridConfigResponse struct {
 	Config grid.GeneratedConfig `json:"config"`
 }
 
+type ManualSessionRequest = browserlabsession.CreateRequest
+type ManualSessionResponse = browserlabsession.CreateResponse
+
 func NewHandler(options ServerOptions) http.Handler {
 	if options.ListenAddr == "" {
 		options.ListenAddr = DefaultListenAddr
@@ -109,6 +114,11 @@ func NewHandler(options ServerOptions) http.Handler {
 	gridManager := grid.Manager{
 		Root:   options.AppSupport.Paths.Root,
 		Runner: options.GridRunner,
+	}
+	sessionManager := browserlabsession.Manager{
+		Store:     registryStore,
+		Grid:      gridManager,
+		WebDriver: options.WebDriverClient,
 	}
 
 	mux := http.NewServeMux()
@@ -298,6 +308,29 @@ func NewHandler(options ServerOptions) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, GridConfigResponse{Config: generated})
 	})
+	mux.HandleFunc("POST /v1/sessions/manual", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browserlabsession.CreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := sessionManager.CreateHeldSession(r.Context(), request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	return mux
 }
 
@@ -388,6 +421,23 @@ func writeGridError(w http.ResponseWriter, err error) {
 	}
 	writeJSON(w, http.StatusInternalServerError, StatusProblem{
 		Code:    "grid_failed",
+		Message: err.Error(),
+	})
+}
+
+func writeSessionError(w http.ResponseWriter, err error) {
+	var problem browserlabsession.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		switch problem.Code {
+		case "webdriver_session_failed", "navigation_failed":
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "session_failed",
 		Message: err.Error(),
 	})
 }

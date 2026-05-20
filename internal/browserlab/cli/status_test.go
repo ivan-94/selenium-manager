@@ -18,6 +18,7 @@ import (
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
+	browserlabsession "github.com/ivan-94/selenium-manager/internal/browserlab/session"
 )
 
 func TestStatusJSONReportsDaemonShape(t *testing.T) {
@@ -436,12 +437,152 @@ func TestGridConfigHumanPrintsReadOnlyConfig(t *testing.T) {
 	}
 }
 
+func TestSessionOpenJSONCreatesHeldManualSessionAndDefaultsURL(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: imageTag,
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &cliWebDriver{
+		sessionID: "session-123",
+		capabilities: map[string]any{
+			"se:vnc": "ws://172.17.0.2:4444/session/session-123/se/vnc",
+		},
+		currentURL: "about:blank",
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:      appSupport,
+		GridRunner:      &cliGridRunner{running: true},
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"session", "open", "chrome", "119.0", "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(session open --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.ManualSessionResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("session JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.SessionID != "session-123" || payload.RequestedURL != "about:blank" || payload.CurrentURL != "about:blank" {
+		t.Fatalf("payload = %+v, want held about:blank session", payload)
+	}
+	if payload.NoVNC.URL != "http://127.0.0.1:4444/ui/#/sessions/session-123" {
+		t.Fatalf("noVNC URL = %q", payload.NoVNC.URL)
+	}
+	if webdriver.navigatedURL != "about:blank" {
+		t.Fatalf("navigated URL = %q, want about:blank", webdriver.navigatedURL)
+	}
+	if webdriver.quitCalled {
+		t.Fatal("CLI-created manual session was quit")
+	}
+}
+
+func TestSessionOpenHumanPrintsSessionDetails(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport: appSupport,
+		GridRunner: &cliGridRunner{running: true},
+		WebDriverClient: &cliWebDriver{
+			sessionID:  "session-456",
+			currentURL: "https://example.test/",
+			title:      "Example",
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"session", "open", "chrome", "119.0", "https://example.test/", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(session open) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"Manual session: session-456",
+		"Browser: Chrome 119.0",
+		"Requested URL: https://example.test/",
+		"Current URL: https://example.test/",
+		"Title: Example",
+		"Grid: http://127.0.0.1:4444",
+		"WebDriver: http://127.0.0.1:4444/wd/hub",
+		"noVNC: http://127.0.0.1:4444/ui/#/sessions/session-456",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, got)
+		}
+	}
+}
+
 type cliRecordingPuller struct {
 	requests []install.PullRequest
 }
 
 type cliGridRunner struct {
 	running bool
+}
+
+type cliWebDriver struct {
+	sessionID          string
+	capabilities       map[string]any
+	currentURL         string
+	title              string
+	newSessionEndpoint string
+	navigatedURL       string
+	quitCalled         bool
+}
+
+func (driver *cliWebDriver) NewSession(_ context.Context, request browserlabsession.NewSessionRequest) (browserlabsession.NewSessionResult, error) {
+	driver.newSessionEndpoint = request.WebDriverEndpoint
+	return browserlabsession.NewSessionResult{SessionID: driver.sessionID, Capabilities: driver.capabilities}, nil
+}
+
+func (driver *cliWebDriver) Navigate(_ context.Context, _ string, _ string, url string) error {
+	driver.navigatedURL = url
+	return nil
+}
+
+func (driver *cliWebDriver) CurrentURL(_ context.Context, _ string, _ string) (string, error) {
+	return driver.currentURL, nil
+}
+
+func (driver *cliWebDriver) Title(_ context.Context, _ string, _ string) (string, error) {
+	return driver.title, nil
+}
+
+func (driver *cliWebDriver) Quit(_ context.Context, _ string, _ string) error {
+	driver.quitCalled = true
+	return nil
 }
 
 func (runner *cliGridRunner) Start(_ context.Context, request grid.StartRequest) (grid.RuntimeState, error) {

@@ -51,6 +51,8 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 		return runBrowsers(args[1:], stdout, stderr)
 	case "grid":
 		return runGrid(args[1:], stdout, stderr)
+	case "session":
+		return runSession(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		writeUsage(stdout)
 		return 0
@@ -66,6 +68,7 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "       browserlab install chrome [version] [--image-tag TAG] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab browsers [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab grid <start|stop|status|config> [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab session open chrome VERSION [URL] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
 }
 
@@ -207,6 +210,55 @@ func runGrid(args []string, stdout io.Writer, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "unknown grid command: %s\n", command)
 		return 64
 	}
+}
+
+func runSession(args []string, stdout io.Writer, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: browserlab session open chrome VERSION [URL] [--json] [--base-url URL]")
+		return 64
+	}
+	command := args[0]
+	switch command {
+	case "open":
+		return runSessionOpen(args[1:], stdout, stderr)
+	default:
+		fmt.Fprintf(stderr, "unknown session command: %s\n", command)
+		return 64
+	}
+}
+
+func runSessionOpen(args []string, stdout io.Writer, stderr io.Writer) int {
+	parsed, err := parseSessionOpenArgs(args)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "usage: browserlab session open chrome VERSION [URL] [--json] [--base-url URL]")
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	result, err := createManualSession(ctx, parsed.baseURL, appSupport.Token, api.ManualSessionRequest{
+		BrowserName:    parsed.browser,
+		BrowserVersion: parsed.version,
+		URL:            parsed.url,
+	})
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "session_failed", err.Error())
+		return 2
+	}
+	if parsed.jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(result)
+		return 0
+	}
+	writeManualSessionHuman(stdout, result)
+	return 0
 }
 
 func runSearch(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -556,6 +608,34 @@ func fetchGridConfig(ctx context.Context, baseURL string, token string) (api.Gri
 	return config, nil
 }
 
+func createManualSession(ctx context.Context, baseURL string, token string, request api.ManualSessionRequest) (api.ManualSessionResponse, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return api.ManualSessionResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/sessions/manual", bytes.NewReader(data))
+	if err != nil {
+		return api.ManualSessionResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.ManualSessionResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.ManualSessionResponse{}, decodeProblem(resp)
+	}
+
+	var result api.ManualSessionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.ManualSessionResponse{}, err
+	}
+	return result, nil
+}
+
 func decodeProblem(resp *http.Response) error {
 	var problem api.StatusProblem
 	if err := json.NewDecoder(resp.Body).Decode(&problem); err == nil && problem.Message != "" {
@@ -593,6 +673,51 @@ type installArgs struct {
 	imageTag   string
 	jsonOutput bool
 	baseURL    string
+}
+
+type sessionOpenArgs struct {
+	browser    string
+	version    string
+	url        string
+	jsonOutput bool
+	baseURL    string
+}
+
+func parseSessionOpenArgs(args []string) (sessionOpenArgs, error) {
+	parsed := sessionOpenArgs{baseURL: defaultBaseURL}
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			parsed.jsonOutput = true
+		case "--base-url":
+			if i+1 >= len(args) {
+				return sessionOpenArgs{}, fmt.Errorf("--base-url requires a URL")
+			}
+			parsed.baseURL = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return sessionOpenArgs{}, fmt.Errorf("unknown flag: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) < 2 {
+		return sessionOpenArgs{}, fmt.Errorf("browser and version are required")
+	}
+	if strings.ToLower(positionals[0]) != "chrome" {
+		return sessionOpenArgs{}, fmt.Errorf("only chrome manual sessions are supported")
+	}
+	parsed.browser = "chrome"
+	parsed.version = positionals[1]
+	if len(positionals) > 2 {
+		parsed.url = positionals[2]
+	}
+	if len(positionals) > 3 {
+		return sessionOpenArgs{}, fmt.Errorf("too many positional arguments")
+	}
+	return parsed, nil
 }
 
 func parseInstallArgs(args []string) (installArgs, error) {
@@ -766,6 +891,34 @@ func writeGridStatusHuman(stdout io.Writer, status grid.Status) {
 	for _, browser := range status.Browsers {
 		fmt.Fprintf(stdout, "- %s %s -> %s\n", browser.BrowserName, browser.BrowserVersion, browser.ImageTag)
 	}
+}
+
+func writeManualSessionHuman(stdout io.Writer, result api.ManualSessionResponse) {
+	fmt.Fprintf(stdout, "Manual session: %s\n", result.SessionID)
+	fmt.Fprintf(stdout, "Browser: %s %s\n", displayBrowserName(result.BrowserName), result.BrowserVersion)
+	fmt.Fprintf(stdout, "Requested URL: %s\n", result.RequestedURL)
+	if result.CurrentURL != "" {
+		fmt.Fprintf(stdout, "Current URL: %s\n", result.CurrentURL)
+	}
+	if result.Title != "" {
+		fmt.Fprintf(stdout, "Title: %s\n", result.Title)
+	}
+	fmt.Fprintf(stdout, "Grid: %s\n", result.GridURL)
+	fmt.Fprintf(stdout, "WebDriver: %s\n", result.WebDriverEndpoint)
+	if result.NoVNC.URL != "" {
+		fmt.Fprintf(stdout, "noVNC: %s\n", result.NoVNC.URL)
+	}
+	if result.NoVNC.VNCWebSocketURL != "" {
+		fmt.Fprintf(stdout, "VNC websocket: %s\n", result.NoVNC.VNCWebSocketURL)
+	}
+}
+
+func displayBrowserName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ""
+	}
+	return strings.ToUpper(name[:1]) + name[1:]
 }
 
 func writeSearchError(stdout io.Writer, asJSON bool, code string, message string) {
