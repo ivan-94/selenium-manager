@@ -1,0 +1,678 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"runtime"
+	"strings"
+	"time"
+
+	"github.com/ivan-94/selenium-manager/internal/browserlab/artifact"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/browser"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/emulation"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
+	browserlabsession "github.com/ivan-94/selenium-manager/internal/browserlab/session"
+)
+
+const DefaultListenAddr = "127.0.0.1:49321"
+
+type ServerOptions struct {
+	AppSupport       config.AppSupport
+	ListenAddr       string
+	Version          string
+	NativeRuntimes   []native.RuntimeStatus
+	CatalogSource    catalog.TagSource
+	ImagePuller      install.ImagePuller
+	GridRunner       grid.RuntimeRunner
+	WebDriverClient  browserlabsession.WebDriverClient
+	SessionChecker   browser.SessionChecker
+	ImageRemover     browser.ImageRemover
+	HostArchitecture string
+}
+
+type StatusResponse struct {
+	State          string                 `json:"state"`
+	Service        string                 `json:"service"`
+	Version        string                 `json:"version"`
+	CheckedAt      string                 `json:"checkedAt"`
+	API            APIStatus              `json:"api"`
+	Paths          PathStatus             `json:"paths"`
+	Checks         []StatusCheck          `json:"checks"`
+	NativeRuntimes []native.RuntimeStatus `json:"nativeRuntimes"`
+	Error          *StatusProblem         `json:"error,omitempty"`
+}
+
+type APIStatus struct {
+	Bind          string `json:"bind"`
+	LocalhostOnly bool   `json:"localhostOnly"`
+}
+
+type PathStatus struct {
+	ConfigDir    string `json:"configDir"`
+	LogsDir      string `json:"logsDir"`
+	ArtifactsDir string `json:"artifactsDir"`
+}
+
+type StatusCheck struct {
+	Name    string `json:"name"`
+	State   string `json:"state"`
+	Message string `json:"message"`
+}
+
+type StatusProblem struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type BrowserSearchResponse struct {
+	Browser string                        `json:"browser"`
+	Query   string                        `json:"query"`
+	Results []catalog.ChromeVersionResult `json:"results"`
+}
+
+type BrowserInstallResponse = install.Result
+type BrowserDisableResponse = browser.DisableResult
+type BrowserUninstallResponse = browser.UninstallResult
+
+type BrowserListResponse struct {
+	Browsers []registry.BrowserRecord `json:"browsers"`
+}
+
+type MobilePresetCatalogResponse struct {
+	Presets []emulation.Preset `json:"presets"`
+}
+
+type GridStatusResponse struct {
+	Status grid.Status `json:"status"`
+}
+
+type GridConfigResponse struct {
+	Config grid.GeneratedConfig `json:"config"`
+}
+
+type ManualSessionRequest = browserlabsession.CreateRequest
+type ManualSessionResponse = browserlabsession.CreateResponse
+type SessionListResponse = browserlabsession.ListResponse
+type SessionCloseResponse = browserlabsession.CloseResponse
+
+type SessionInspectResponse struct {
+	Session browserlabsession.Record `json:"session"`
+}
+
+type SessionScreenshotRequest = browserlabsession.CaptureSessionRequest
+type ScreenshotRunRequest = browserlabsession.CreateRequest
+type ScreenshotResponse = browserlabsession.ScreenshotResult
+
+func NewHandler(options ServerOptions) http.Handler {
+	if options.ListenAddr == "" {
+		options.ListenAddr = DefaultListenAddr
+	}
+	if options.Version == "" {
+		options.Version = "dev"
+	}
+	if options.CatalogSource == nil {
+		source := catalog.NewDockerHubTagSource()
+		options.CatalogSource = source
+	}
+	if options.HostArchitecture == "" {
+		options.HostArchitecture = runtime.GOARCH
+	}
+	registryStore := registry.NewFileStore(options.AppSupport.Paths.Root)
+	installer := install.Installer{
+		Store:            registryStore,
+		CatalogSource:    options.CatalogSource,
+		ImagePuller:      options.ImagePuller,
+		HostArchitecture: options.HostArchitecture,
+	}
+	gridManager := grid.Manager{
+		Root:   options.AppSupport.Paths.Root,
+		Runner: options.GridRunner,
+	}
+	activeSessions := browserlabsession.NewMemoryStore()
+	sessionManager := browserlabsession.Manager{
+		Store:          registryStore,
+		Grid:           gridManager,
+		WebDriver:      options.WebDriverClient,
+		ActiveSessions: activeSessions,
+		ArtifactStore: artifact.Store{
+			Root: options.AppSupport.Paths.ArtifactsDir,
+		},
+	}
+	sessionChecker := options.SessionChecker
+	if sessionChecker == nil {
+		sessionChecker = activeSessionChecker{store: activeSessions}
+	}
+	browserManager := browser.Manager{
+		Store:          registryStore,
+		SessionChecker: sessionChecker,
+		ImageRemover:   options.ImageRemover,
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"state":   "running",
+			"service": "browserlabd",
+		})
+	})
+	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, NewStatusResponse(options))
+	})
+	mux.HandleFunc("GET /v1/browsers/search", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browser := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("browser")))
+		if browser == "" {
+			browser = "chrome"
+		}
+		if browser != "chrome" {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "unsupported_browser",
+				Message: "only official Selenium Chrome search is supported in this slice",
+			})
+			return
+		}
+		query := strings.TrimSpace(r.URL.Query().Get("q"))
+		results, err := catalog.SearchChromeVersions(r.Context(), options.CatalogSource, catalog.SearchOptions{
+			Query:            query,
+			HostArchitecture: options.HostArchitecture,
+		})
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, StatusProblem{
+				Code:    "catalog_search_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, BrowserSearchResponse{
+			Browser: browser,
+			Query:   query,
+			Results: results,
+		})
+	})
+	mux.HandleFunc("POST /v1/browsers/install", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request install.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := installer.Install(r.Context(), request)
+		if err != nil {
+			writeInstallError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /v1/browsers/installed", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, BrowserListResponse{Browsers: browsers})
+	})
+	mux.HandleFunc("GET /v1/mobile-presets", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, MobilePresetCatalogResponse{Presets: emulation.Catalog()})
+	})
+	mux.HandleFunc("POST /v1/browsers/disable", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browser.DisableRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := browserManager.Disable(r.Context(), request)
+		if err != nil {
+			writeBrowserError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /v1/browsers/uninstall", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browser.UninstallRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := browserManager.Uninstall(r.Context(), request)
+		if err != nil {
+			writeBrowserError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /v1/grid/status", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		status, err := gridManager.Status(r.Context(), browsers)
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridStatusResponse{Status: status})
+	})
+	mux.HandleFunc("POST /v1/grid/start", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		status, err := gridManager.Start(r.Context(), browsers)
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridStatusResponse{Status: status})
+	})
+	mux.HandleFunc("POST /v1/grid/stop", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		status, err := gridManager.Stop(r.Context(), browsers)
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridStatusResponse{Status: status})
+	})
+	mux.HandleFunc("GET /v1/grid/config", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		generated, err := grid.GenerateConfig(browsers, grid.ConfigOptions{})
+		if err != nil {
+			writeGridError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, GridConfigResponse{Config: generated})
+	})
+	mux.HandleFunc("POST /v1/sessions/manual", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browserlabsession.CreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := sessionManager.CreateHeldSession(r.Context(), request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /v1/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		result, err := sessionManager.ListSessions(r.Context())
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /v1/sessions/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		result, err := sessionManager.InspectSession(r.Context(), r.PathValue("sessionID"))
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, SessionInspectResponse{Session: result})
+	})
+	mux.HandleFunc("DELETE /v1/sessions/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		result, err := sessionManager.CloseSession(r.Context(), r.PathValue("sessionID"))
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /v1/sessions/screenshot", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browserlabsession.CaptureSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := sessionManager.CaptureSessionScreenshot(r.Context(), request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /v1/screenshots/run", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browserlabsession.CreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := sessionManager.CaptureScreenshotRun(r.Context(), request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	return mux
+}
+
+func NewStatusResponse(options ServerOptions) StatusResponse {
+	if options.ListenAddr == "" {
+		options.ListenAddr = DefaultListenAddr
+	}
+	if options.Version == "" {
+		options.Version = "dev"
+	}
+	nativeRuntimes := options.NativeRuntimes
+	if nativeRuntimes == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		nativeRuntimes = native.DetectAll(ctx)
+	}
+
+	return StatusResponse{
+		State:     "running",
+		Service:   "browserlabd",
+		Version:   options.Version,
+		CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		API: APIStatus{
+			Bind:          options.ListenAddr,
+			LocalhostOnly: IsLocalListenAddr(options.ListenAddr),
+		},
+		Paths: PathStatus{
+			ConfigDir:    options.AppSupport.Paths.ConfigDir,
+			LogsDir:      options.AppSupport.Paths.LogsDir,
+			ArtifactsDir: options.AppSupport.Paths.ArtifactsDir,
+		},
+		Checks: []StatusCheck{{
+			Name:    "daemon",
+			State:   "ok",
+			Message: "daemon is reachable",
+		}},
+		NativeRuntimes: nativeRuntimes,
+	}
+}
+
+func IsLocalListenAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	host = strings.Trim(host, "[]")
+	return host == "127.0.0.1" || host == "::1" || strings.EqualFold(host, "localhost")
+}
+
+type activeSessionChecker struct {
+	store browserlabsession.Store
+}
+
+func (checker activeSessionChecker) ActiveSessionsForBrowser(_ context.Context, record registry.BrowserRecord) ([]browser.ActiveSession, error) {
+	if checker.store == nil {
+		return nil, nil
+	}
+	sessions, err := checker.store.List()
+	if err != nil {
+		return nil, err
+	}
+	active := make([]browser.ActiveSession, 0, len(sessions))
+	for _, session := range sessions {
+		if session.Status != browserlabsession.StatusActive {
+			continue
+		}
+		if !strings.EqualFold(session.BrowserName, record.Family) || strings.TrimSpace(session.BrowserVersion) != strings.TrimSpace(record.Version) {
+			continue
+		}
+		active = append(active, browser.ActiveSession{
+			ID:             session.SessionID,
+			BrowserName:    session.BrowserName,
+			BrowserVersion: session.BrowserVersion,
+			ImageTag:       record.ImageTag,
+		})
+	}
+	return active, nil
+}
+
+func authorized(r *http.Request, token string) bool {
+	if token == "" {
+		return false
+	}
+	return r.Header.Get("Authorization") == "Bearer "+token
+}
+
+func writeJSON(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeInstallError(w http.ResponseWriter, err error) {
+	var problem install.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		if problem.Code == "pull_failed" || problem.Code == "catalog_search_failed" {
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "install_failed",
+		Message: err.Error(),
+	})
+}
+
+func writeGridError(w http.ResponseWriter, err error) {
+	var problem grid.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		if problem.Code == "grid_start_failed" || problem.Code == "grid_stop_failed" {
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "grid_failed",
+		Message: err.Error(),
+	})
+}
+
+func writeSessionError(w http.ResponseWriter, err error) {
+	var problem browserlabsession.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		switch problem.Code {
+		case "webdriver_session_failed", "navigation_failed", "screenshot_failed":
+			status = http.StatusBadGateway
+		case "session_not_found":
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "session_failed",
+		Message: err.Error(),
+	})
+}
+
+func writeBrowserError(w http.ResponseWriter, err error) {
+	var problem browser.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		switch problem.Code {
+		case "active_sessions_block_uninstall":
+			status = http.StatusConflict
+		case "browser_not_installed":
+			status = http.StatusNotFound
+		case "image_delete_failed":
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "browser_management_failed",
+		Message: err.Error(),
+	})
+}
