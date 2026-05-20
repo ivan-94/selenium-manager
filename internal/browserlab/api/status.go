@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"runtime"
@@ -11,7 +12,9 @@ import (
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
 )
 
 const DefaultListenAddr = "127.0.0.1:49321"
@@ -22,6 +25,7 @@ type ServerOptions struct {
 	Version          string
 	NativeRuntimes   []native.RuntimeStatus
 	CatalogSource    catalog.TagSource
+	ImagePuller      install.ImagePuller
 	HostArchitecture string
 }
 
@@ -65,6 +69,12 @@ type BrowserSearchResponse struct {
 	Results []catalog.ChromeVersionResult `json:"results"`
 }
 
+type BrowserInstallResponse = install.Result
+
+type BrowserListResponse struct {
+	Browsers []registry.BrowserRecord `json:"browsers"`
+}
+
 func NewHandler(options ServerOptions) http.Handler {
 	if options.ListenAddr == "" {
 		options.ListenAddr = DefaultListenAddr
@@ -78,6 +88,13 @@ func NewHandler(options ServerOptions) http.Handler {
 	}
 	if options.HostArchitecture == "" {
 		options.HostArchitecture = runtime.GOARCH
+	}
+	registryStore := registry.NewFileStore(options.AppSupport.Paths.Root)
+	installer := install.Installer{
+		Store:            registryStore,
+		CatalogSource:    options.CatalogSource,
+		ImagePuller:      options.ImagePuller,
+		HostArchitecture: options.HostArchitecture,
 	}
 
 	mux := http.NewServeMux()
@@ -133,6 +150,47 @@ func NewHandler(options ServerOptions) http.Handler {
 			Query:   query,
 			Results: results,
 		})
+	})
+	mux.HandleFunc("POST /v1/browsers/install", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request install.Request
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := installer.Install(r.Context(), request)
+		if err != nil {
+			writeInstallError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /v1/browsers/installed", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		browsers, err := registryStore.List()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, StatusProblem{
+				Code:    "registry_read_failed",
+				Message: err.Error(),
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, BrowserListResponse{Browsers: browsers})
 	})
 	return mux
 }
@@ -194,4 +252,20 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeInstallError(w http.ResponseWriter, err error) {
+	var problem install.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		if problem.Code == "pull_failed" || problem.Code == "catalog_search_failed" {
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "install_failed",
+		Message: err.Error(),
+	})
 }

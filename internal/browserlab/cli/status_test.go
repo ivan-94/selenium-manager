@@ -14,6 +14,7 @@ import (
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 )
 
@@ -250,6 +251,121 @@ func TestSearchChromeHumanShowsBrowserVersionFirstAndTagDetails(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Apple Silicon") {
 		t.Fatalf("stdout = %q, want Apple Silicon warning", stdout.String())
 	}
+}
+
+func TestInstallChromeByVersionJSONReportsStructuredResult(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	puller := &cliRecordingPuller{}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:       appSupport,
+		CatalogSource:    catalog.StaticTagSource{Page: readChromeTagsFixture(t)},
+		HostArchitecture: "amd64",
+		ImagePuller:      puller,
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"install", "chrome", "119.0", "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(install chrome --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.BrowserInstallResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("install JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.Record.ImageTag != "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404" {
+		t.Fatalf("imageTag = %q, want exact Selenium tag", payload.Record.ImageTag)
+	}
+	if payload.Record.Source != "selenium-dockerhub" || !payload.Record.Enabled {
+		t.Fatalf("record = %+v, want source and enabled state", payload.Record)
+	}
+	if len(payload.Progress) == 0 {
+		t.Fatal("progress was empty")
+	}
+	if len(puller.requests) != 1 || puller.requests[0].ImageTag != payload.Record.ImageTag {
+		t.Fatalf("pull requests = %+v, want exact pull", puller.requests)
+	}
+}
+
+func TestInstallChromeByImageTagJSON(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:       appSupport,
+		CatalogSource:    catalog.StaticTagSource{Page: readChromeTagsFixture(t)},
+		HostArchitecture: "amd64",
+		ImagePuller:      &cliRecordingPuller{},
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"install", "chrome", "--image-tag", imageTag, "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(install chrome --image-tag --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.BrowserInstallResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("install JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.Record.Version != "119.0" {
+		t.Fatalf("version = %q, want parsed image version", payload.Record.Version)
+	}
+	if payload.Record.ImageTag != imageTag {
+		t.Fatalf("imageTag = %q, want %q", payload.Record.ImageTag, imageTag)
+	}
+}
+
+func TestBrowsersJSONListsInstalledRegistryEntries(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:       appSupport,
+		CatalogSource:    catalog.StaticTagSource{Page: readChromeTagsFixture(t)},
+		HostArchitecture: "amd64",
+		ImagePuller:      &cliRecordingPuller{},
+	}))
+	t.Cleanup(server.Close)
+
+	var installOut bytes.Buffer
+	if code := Run([]string{"install", "chrome", "119.0", "--json", "--base-url", server.URL}, &installOut, &bytes.Buffer{}); code != 0 {
+		t.Fatalf("install exit = %d, want 0; output %s", code, installOut.String())
+	}
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"browsers", "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(browsers --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.BrowserListResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("browsers JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if len(payload.Browsers) != 1 || payload.Browsers[0].Family != "chrome" || !payload.Browsers[0].Enabled {
+		t.Fatalf("browsers = %+v, want installed chrome", payload.Browsers)
+	}
+}
+
+type cliRecordingPuller struct {
+	requests []install.PullRequest
+}
+
+func (puller *cliRecordingPuller) PullImage(_ context.Context, request install.PullRequest, report func(install.ProgressEvent)) error {
+	puller.requests = append(puller.requests, request)
+	if report != nil {
+		report(install.ProgressEvent{Stage: "pulling", Message: request.ImageTag})
+	}
+	return nil
 }
 
 func readChromeTagsFixture(t *testing.T) catalog.DockerHubTagsPage {
