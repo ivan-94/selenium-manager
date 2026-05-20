@@ -11,8 +11,11 @@ struct BrowserLabApplication: App {
                 DaemonLifecycleControlsView(viewModel: DaemonLifecycleViewModel(
                     client: BrowserLabCLIDaemonLifecycleClient()
                 ))
+                let browserClient = URLSessionBrowserSearchClient()
                 BrowserSearchView(viewModel: BrowserSearchViewModel(
-                    client: URLSessionBrowserSearchClient()
+                    client: browserClient,
+                    installer: browserClient,
+                    lister: browserClient
                 ))
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24)

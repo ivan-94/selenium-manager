@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/lifecycle"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 )
@@ -42,6 +44,10 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 		return runStatus(args[1:], stdout, stderr)
 	case "search":
 		return runSearch(args[1:], stdout, stderr)
+	case "install":
+		return runInstall(args[1:], stdout, stderr)
+	case "browsers":
+		return runBrowsers(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		writeUsage(stdout)
 		return 0
@@ -54,7 +60,79 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "usage: browserlab status [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab search chrome [query] [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab install chrome [version] [--image-tag TAG] [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab browsers [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
+}
+
+func runInstall(args []string, stdout io.Writer, stderr io.Writer) int {
+	parsed, err := parseInstallArgs(args)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "usage: browserlab install chrome [version] [--image-tag TAG] [--json] [--base-url URL]")
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	result, err := installBrowser(ctx, parsed.baseURL, appSupport.Token, install.Request{
+		BrowserName:    parsed.browser,
+		BrowserVersion: parsed.version,
+		ImageTag:       parsed.imageTag,
+	})
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "install_failed", err.Error())
+		return 2
+	}
+
+	if parsed.jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(result)
+		return 0
+	}
+	writeInstallHuman(stdout, result)
+	return 0
+}
+
+func runBrowsers(args []string, stdout io.Writer, stderr io.Writer) int {
+	flags := flag.NewFlagSet("browsers", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	jsonOutput := flags.Bool("json", false, "write machine-readable JSON")
+	baseURL := flags.String("base-url", defaultBaseURL, "daemon base URL")
+	if err := flags.Parse(args); err != nil {
+		return 64
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(stderr, "unexpected argument: %s\n", flags.Arg(0))
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, *jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	list, err := fetchInstalledBrowsers(ctx, *baseURL, appSupport.Token)
+	if err != nil {
+		writeProblem(stdout, *jsonOutput, "daemon_unreachable", err.Error())
+		return 2
+	}
+	if *jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(list)
+		return 0
+	}
+	writeBrowsersHuman(stdout, list)
+	return 0
 }
 
 func runSearch(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -283,6 +361,66 @@ func fetchBrowserSearch(ctx context.Context, baseURL string, token string, brows
 	return search, nil
 }
 
+func installBrowser(ctx context.Context, baseURL string, token string, request install.Request) (api.BrowserInstallResponse, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return api.BrowserInstallResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/browsers/install", bytes.NewReader(data))
+	if err != nil {
+		return api.BrowserInstallResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.BrowserInstallResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return api.BrowserInstallResponse{}, decodeProblem(resp)
+	}
+
+	var result api.BrowserInstallResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.BrowserInstallResponse{}, err
+	}
+	return result, nil
+}
+
+func fetchInstalledBrowsers(ctx context.Context, baseURL string, token string) (api.BrowserListResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/browsers/installed", nil)
+	if err != nil {
+		return api.BrowserListResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.BrowserListResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.BrowserListResponse{}, decodeProblem(resp)
+	}
+
+	var list api.BrowserListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+		return api.BrowserListResponse{}, err
+	}
+	return list, nil
+}
+
+func decodeProblem(resp *http.Response) error {
+	var problem api.StatusProblem
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err == nil && problem.Message != "" {
+		return fmt.Errorf("%s: %s", problem.Code, problem.Message)
+	}
+	return fmt.Errorf("daemon returned HTTP %d", resp.StatusCode)
+}
+
 func writeStopped(stdout io.Writer, asJSON bool, code string, message string) {
 	if asJSON {
 		_ = json.NewEncoder(stdout).Encode(api.StatusResponse{
@@ -304,6 +442,59 @@ type searchArgs struct {
 	query      string
 	jsonOutput bool
 	baseURL    string
+}
+
+type installArgs struct {
+	browser    string
+	version    string
+	imageTag   string
+	jsonOutput bool
+	baseURL    string
+}
+
+func parseInstallArgs(args []string) (installArgs, error) {
+	parsed := installArgs{baseURL: defaultBaseURL}
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			parsed.jsonOutput = true
+		case "--base-url":
+			if i+1 >= len(args) {
+				return installArgs{}, fmt.Errorf("--base-url requires a URL")
+			}
+			parsed.baseURL = args[i+1]
+			i++
+		case "--image-tag":
+			if i+1 >= len(args) {
+				return installArgs{}, fmt.Errorf("--image-tag requires a tag")
+			}
+			parsed.imageTag = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return installArgs{}, fmt.Errorf("unknown flag: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) == 0 {
+		return installArgs{}, fmt.Errorf("browser is required")
+	}
+	if strings.ToLower(positionals[0]) != "chrome" {
+		return installArgs{}, fmt.Errorf("only chrome install is supported")
+	}
+	parsed.browser = "chrome"
+	if len(positionals) > 1 {
+		parsed.version = positionals[1]
+	}
+	if len(positionals) > 2 {
+		return installArgs{}, fmt.Errorf("too many positional arguments")
+	}
+	if parsed.version == "" && parsed.imageTag == "" {
+		return installArgs{}, fmt.Errorf("version or --image-tag is required")
+	}
+	return parsed, nil
 }
 
 func parseSearchArgs(args []string) (searchArgs, error) {
@@ -380,12 +571,57 @@ func writeSearchHuman(stdout io.Writer, search api.BrowserSearchResponse) {
 	}
 }
 
+func writeInstallHuman(stdout io.Writer, result api.BrowserInstallResponse) {
+	record := result.Record
+	if result.AlreadyInstalled {
+		fmt.Fprintf(stdout, "Chrome %s is already installed.\n", record.Version)
+	} else {
+		fmt.Fprintf(stdout, "Installed Chrome %s.\n", record.Version)
+	}
+	fmt.Fprintf(stdout, "Image: %s\n", record.ImageTag)
+	fmt.Fprintf(stdout, "Platform: %s\n", record.Platform)
+	fmt.Fprintf(stdout, "Source: %s\n", record.Source)
+	for _, warning := range result.Warnings {
+		fmt.Fprintf(stdout, "Warning: %s\n", warning)
+	}
+	for _, event := range result.Progress {
+		if event.Message != "" {
+			fmt.Fprintf(stdout, "Progress: %s\n", event.Message)
+		}
+	}
+}
+
+func writeBrowsersHuman(stdout io.Writer, list api.BrowserListResponse) {
+	if len(list.Browsers) == 0 {
+		fmt.Fprintln(stdout, "No browsers installed.")
+		return
+	}
+	for _, browser := range list.Browsers {
+		state := "disabled"
+		if browser.Enabled {
+			state = "enabled"
+		}
+		fmt.Fprintf(stdout, "Chrome %s (%s)\n", browser.Version, state)
+		fmt.Fprintf(stdout, "  Image: %s\n", browser.ImageTag)
+		fmt.Fprintf(stdout, "  Platform: %s\n", browser.Platform)
+		fmt.Fprintf(stdout, "  Source: %s\n", browser.Source)
+	}
+}
+
 func writeSearchError(stdout io.Writer, asJSON bool, code string, message string) {
+	if asJSON {
+		writeProblem(stdout, true, code, message)
+		return
+	}
+	fmt.Fprintf(stdout, "BrowserLab search failed: %s\n", message)
+}
+
+func writeProblem(stdout io.Writer, asJSON bool, code string, message string) {
 	if asJSON {
 		_ = json.NewEncoder(stdout).Encode(api.StatusProblem{Code: code, Message: message})
 		return
 	}
-	fmt.Fprintf(stdout, "BrowserLab search failed: %s\n", message)
+	fmt.Fprintf(stdout, "BrowserLab error: %s\n", message)
 }
 
 func Main() {
