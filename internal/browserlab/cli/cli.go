@@ -12,27 +12,44 @@ import (
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/lifecycle"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 )
 
 const defaultBaseURL = "http://" + api.DefaultListenAddr
 
+type Options struct {
+	LifecycleRunner lifecycle.Runner
+	UID             func() int
+}
+
 func Run(args []string, stdout io.Writer, stderr io.Writer) int {
+	return RunWithOptions(args, stdout, stderr, Options{})
+}
+
+func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options Options) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: browserlab status [--json] [--base-url URL]")
+		writeUsage(stderr)
 		return 64
 	}
 
 	switch args[0] {
+	case "daemon":
+		return runDaemon(args[1:], stdout, stderr, options)
 	case "status":
 		return runStatus(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
-		fmt.Fprintln(stdout, "usage: browserlab status [--json] [--base-url URL]")
+		writeUsage(stdout)
 		return 0
 	default:
 		fmt.Fprintf(stderr, "unknown command: %s\n", args[0])
 		return 64
 	}
+}
+
+func writeUsage(w io.Writer) {
+	fmt.Fprintln(w, "usage: browserlab status [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
 }
 
 func runStatus(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -94,6 +111,81 @@ func writeNativeRuntimes(stdout io.Writer, runtimes []native.RuntimeStatus) {
 			fmt.Fprintf(stdout, "  Scope: %s\n", runtime.OutOfScope)
 		}
 	}
+}
+
+func runDaemon(args []string, stdout io.Writer, stderr io.Writer, options Options) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
+		return 64
+	}
+
+	command := args[0]
+	flags := flag.NewFlagSet("daemon "+command, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	daemonPathFlag := flags.String("daemon-path", "", "path to browserlabd executable")
+	if err := flags.Parse(args[1:]); err != nil {
+		return 64
+	}
+	if flags.NArg() != 0 {
+		fmt.Fprintf(stderr, "unexpected argument: %s\n", flags.Arg(0))
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon %s failed: %v\n", command, err)
+		return 1
+	}
+
+	daemonPath, err := lifecycle.ResolveDaemonPath(*daemonPathFlag)
+	if err != nil && command != "stop" && command != "status" && command != "logs" {
+		fmt.Fprintf(stderr, "daemon %s failed: %v\n", command, err)
+		return 1
+	}
+
+	manager := lifecycle.Manager{
+		AppSupport: appSupport,
+		DaemonPath: daemonPath,
+		Runner:     options.LifecycleRunner,
+		UID:        options.UID,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var result lifecycle.Result
+	switch command {
+	case "install":
+		result, err = manager.Install()
+	case "start":
+		result, err = manager.Start(ctx)
+	case "stop":
+		result, err = manager.Stop(ctx)
+	case "restart":
+		result, err = manager.Restart(ctx)
+	case "status":
+		result, err = manager.Status(ctx)
+	case "logs":
+		result, err = manager.Logs()
+	default:
+		fmt.Fprintf(stderr, "unknown daemon command: %s\n", command)
+		return 64
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "daemon %s failed: %v\n", command, err)
+		return 1
+	}
+
+	switch command {
+	case "status", "logs":
+		fmt.Fprint(stdout, result.Output)
+	default:
+		fmt.Fprintf(stdout, "%s\n", result.Message)
+		if result.PlistPath != "" {
+			fmt.Fprintf(stdout, "LaunchAgent: %s\n", result.PlistPath)
+		}
+	}
+	return 0
 }
 
 func fetchStatus(ctx context.Context, baseURL string, token string) (api.StatusResponse, error) {

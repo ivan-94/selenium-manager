@@ -4,10 +4,15 @@ import SwiftUI
 struct BrowserLabApplication: App {
     var body: some Scene {
         WindowGroup {
-            DaemonStatusView(viewModel: DaemonStatusViewModel(
-                client: URLSessionDaemonStatusClient()
-            ))
-            .frame(minWidth: 360, minHeight: 180)
+            VStack(alignment: .leading, spacing: 0) {
+                DaemonStatusView(viewModel: DaemonStatusViewModel(
+                    client: URLSessionDaemonStatusClient()
+                ))
+                DaemonLifecycleControlsView(viewModel: DaemonLifecycleViewModel(
+                    client: BrowserLabCLIDaemonLifecycleClient()
+                ))
+            }
+            .frame(minWidth: 460, minHeight: 280)
         }
     }
 }
