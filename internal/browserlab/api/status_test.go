@@ -551,6 +551,152 @@ func TestManualSessionEndpointCreatesHeldSessionFromInstalledBrowser(t *testing.
 	}
 }
 
+func TestSessionScreenshotEndpointWritesArtifactUnderAppSupport(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	webdriver := &apiWebDriver{
+		currentURL: "https://example.test/current",
+		title:      "Example",
+		screenshot: []byte("png"),
+	}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:      appSupport,
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	body := bytes.NewBufferString(`{
+		"sessionId":"session-123",
+		"browserName":"chrome",
+		"browserVersion":"119.0",
+		"requestedUrl":"https://example.test/",
+		"webdriverEndpoint":"http://127.0.0.1:4444/wd/hub"
+	}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/sessions/screenshot", body)
+	if err != nil {
+		t.Fatalf("NewRequest(screenshot) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/sessions/screenshot error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/sessions/screenshot status = %d, want 200", resp.StatusCode)
+	}
+
+	var payload ScreenshotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode screenshot response: %v", err)
+	}
+	if !strings.HasPrefix(payload.ScreenshotPath, appSupport.Paths.ArtifactsDir) {
+		t.Fatalf("screenshot path = %q, want under %q", payload.ScreenshotPath, appSupport.Paths.ArtifactsDir)
+	}
+	if payload.GroupType != "session" || payload.SessionID != "session-123" {
+		t.Fatalf("payload = %+v, want session artifact", payload)
+	}
+	if webdriver.screenshotSessionID != "session-123" {
+		t.Fatalf("screenshot session ID = %q", webdriver.screenshotSessionID)
+	}
+}
+
+func TestScreenshotRunEndpointCreatesShortLivedSession(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &apiWebDriver{
+		sessionID:  "run-session-123",
+		currentURL: "https://example.test/",
+		title:      "Example",
+		screenshot: []byte("png"),
+	}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:      appSupport,
+		GridRunner:      &apiGridRunner{running: true},
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	body := bytes.NewBufferString(`{"browserName":"chrome","browserVersion":"119.0","url":"https://example.test/"}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/screenshots/run", body)
+	if err != nil {
+		t.Fatalf("NewRequest(screenshot run) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/screenshots/run error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/screenshots/run status = %d, want 200", resp.StatusCode)
+	}
+
+	var payload ScreenshotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode screenshot run response: %v", err)
+	}
+	if payload.GroupType != "run" || payload.SessionID != "run-session-123" || payload.RunID == "" {
+		t.Fatalf("payload = %+v, want run artifact", payload)
+	}
+	if !webdriver.quitCalled {
+		t.Fatal("short-lived screenshot run did not quit WebDriver session")
+	}
+}
+
+func TestSessionScreenshotEndpointMapsScreenshotFailure(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:      appSupport,
+		WebDriverClient: &apiWebDriver{screenshotErr: errors.New("no such window")},
+	}))
+	t.Cleanup(server.Close)
+
+	body := bytes.NewBufferString(`{"sessionId":"session-123","browserName":"chrome","browserVersion":"119.0","webdriverEndpoint":"http://127.0.0.1:4444/wd/hub"}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/sessions/screenshot", body)
+	if err != nil {
+		t.Fatalf("NewRequest(screenshot) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/sessions/screenshot error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("POST /v1/sessions/screenshot status = %d, want 502", resp.StatusCode)
+	}
+	var problem StatusProblem
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem.Code != "screenshot_failed" {
+		t.Fatalf("problem = %+v, want screenshot_failed", problem)
+	}
+}
+
 func TestDefaultListenAddrIsLocalhostOnly(t *testing.T) {
 	if !IsLocalListenAddr(DefaultListenAddr) {
 		t.Fatalf("DefaultListenAddr %q must be localhost-only", DefaultListenAddr)
@@ -586,13 +732,16 @@ type apiGridRunner struct {
 }
 
 type apiWebDriver struct {
-	sessionID          string
-	capabilities       map[string]any
-	currentURL         string
-	title              string
-	newSessionEndpoint string
-	navigatedURL       string
-	quitCalled         bool
+	sessionID           string
+	capabilities        map[string]any
+	currentURL          string
+	title               string
+	newSessionEndpoint  string
+	navigatedURL        string
+	quitCalled          bool
+	screenshot          []byte
+	screenshotErr       error
+	screenshotSessionID string
 }
 
 func (driver *apiWebDriver) NewSession(_ context.Context, request browserlabsession.NewSessionRequest) (browserlabsession.NewSessionResult, error) {
@@ -616,6 +765,14 @@ func (driver *apiWebDriver) Title(_ context.Context, _ string, _ string) (string
 func (driver *apiWebDriver) Quit(_ context.Context, _ string, _ string) error {
 	driver.quitCalled = true
 	return nil
+}
+
+func (driver *apiWebDriver) Screenshot(_ context.Context, _ string, sessionID string) ([]byte, error) {
+	driver.screenshotSessionID = sessionID
+	if driver.screenshotErr != nil {
+		return nil, driver.screenshotErr
+	}
+	return driver.screenshot, nil
 }
 
 func (runner *apiGridRunner) Start(_ context.Context, request grid.StartRequest) (grid.RuntimeState, error) {

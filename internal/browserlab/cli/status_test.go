@@ -544,6 +544,91 @@ func TestSessionOpenHumanPrintsSessionDetails(t *testing.T) {
 	}
 }
 
+func TestScreenshotRunJSONOutputsArtifactPaths(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport: appSupport,
+		GridRunner: &cliGridRunner{running: true},
+		WebDriverClient: &cliWebDriver{
+			sessionID:  "run-session-123",
+			currentURL: "https://example.test/",
+			title:      "Example",
+			screenshot: []byte("png"),
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"screenshot", "chrome", "119.0", "https://example.test/", "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(screenshot --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.ScreenshotResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("screenshot JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.GroupType != "run" || payload.ScreenshotPath == "" || payload.MetadataPath == "" || payload.ResultPath == "" || payload.SummaryPath == "" {
+		t.Fatalf("payload = %+v, want run artifact paths", payload)
+	}
+}
+
+func TestSessionScreenshotHumanOutputsArtifactPaths(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport: appSupport,
+		WebDriverClient: &cliWebDriver{
+			currentURL: "https://example.test/",
+			title:      "Example",
+			screenshot: []byte("png"),
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{
+		"session", "screenshot", "session-123",
+		"--browser", "chrome",
+		"--version", "119.0",
+		"--webdriver-endpoint", "http://127.0.0.1:4444/wd/hub",
+		"--base-url", server.URL,
+	}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(session screenshot) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	got := stdout.String()
+	for _, want := range []string{
+		"Screenshot artifact:",
+		"Screenshot:",
+		"Metadata:",
+		"Result:",
+		"Summary:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("stdout missing %q:\n%s", want, got)
+		}
+	}
+}
+
 type cliRecordingPuller struct {
 	requests []install.PullRequest
 }
@@ -560,6 +645,8 @@ type cliWebDriver struct {
 	newSessionEndpoint string
 	navigatedURL       string
 	quitCalled         bool
+	screenshot         []byte
+	screenshotErr      error
 }
 
 func (driver *cliWebDriver) NewSession(_ context.Context, request browserlabsession.NewSessionRequest) (browserlabsession.NewSessionResult, error) {
@@ -583,6 +670,13 @@ func (driver *cliWebDriver) Title(_ context.Context, _ string, _ string) (string
 func (driver *cliWebDriver) Quit(_ context.Context, _ string, _ string) error {
 	driver.quitCalled = true
 	return nil
+}
+
+func (driver *cliWebDriver) Screenshot(_ context.Context, _ string, _ string) ([]byte, error) {
+	if driver.screenshotErr != nil {
+		return nil, driver.screenshotErr
+	}
+	return driver.screenshot, nil
 }
 
 func (runner *cliGridRunner) Start(_ context.Context, request grid.StartRequest) (grid.RuntimeState, error) {

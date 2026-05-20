@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ivan-94/selenium-manager/internal/browserlab/artifact"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
@@ -89,6 +90,9 @@ type GridConfigResponse struct {
 
 type ManualSessionRequest = browserlabsession.CreateRequest
 type ManualSessionResponse = browserlabsession.CreateResponse
+type SessionScreenshotRequest = browserlabsession.CaptureSessionRequest
+type ScreenshotRunRequest = browserlabsession.CreateRequest
+type ScreenshotResponse = browserlabsession.ScreenshotResult
 
 func NewHandler(options ServerOptions) http.Handler {
 	if options.ListenAddr == "" {
@@ -119,6 +123,9 @@ func NewHandler(options ServerOptions) http.Handler {
 		Store:     registryStore,
 		Grid:      gridManager,
 		WebDriver: options.WebDriverClient,
+		ArtifactStore: artifact.Store{
+			Root: options.AppSupport.Paths.ArtifactsDir,
+		},
 	}
 
 	mux := http.NewServeMux()
@@ -331,6 +338,52 @@ func NewHandler(options ServerOptions) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("POST /v1/sessions/screenshot", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browserlabsession.CaptureSessionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := sessionManager.CaptureSessionScreenshot(r.Context(), request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /v1/screenshots/run", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browserlabsession.CreateRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := sessionManager.CaptureScreenshotRun(r.Context(), request)
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	return mux
 }
 
@@ -430,7 +483,7 @@ func writeSessionError(w http.ResponseWriter, err error) {
 	if errors.As(err, &problem) {
 		status := http.StatusBadRequest
 		switch problem.Code {
-		case "webdriver_session_failed", "navigation_failed":
+		case "webdriver_session_failed", "navigation_failed", "screenshot_failed":
 			status = http.StatusBadGateway
 		}
 		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})

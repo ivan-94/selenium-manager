@@ -3,6 +3,7 @@ package session
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ivan-94/selenium-manager/internal/browserlab/artifact"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
 )
@@ -34,6 +36,18 @@ type CreateResponse struct {
 	StartedAt         string          `json:"startedAt"`
 }
 
+type CaptureSessionRequest struct {
+	SessionID         string `json:"sessionId"`
+	BrowserName       string `json:"browserName"`
+	BrowserVersion    string `json:"browserVersion"`
+	RequestedURL      string `json:"requestedUrl,omitempty"`
+	CurrentURL        string `json:"currentUrl,omitempty"`
+	Title             string `json:"title,omitempty"`
+	WebDriverEndpoint string `json:"webdriverEndpoint"`
+}
+
+type ScreenshotResult = artifact.ScreenshotResult
+
 type NoVNCResolution struct {
 	URL             string `json:"url,omitempty"`
 	VNCWebSocketURL string `json:"vncWebSocketUrl,omitempty"`
@@ -56,14 +70,16 @@ type WebDriverClient interface {
 	Navigate(ctx context.Context, webDriverEndpoint string, sessionID string, url string) error
 	CurrentURL(ctx context.Context, webDriverEndpoint string, sessionID string) (string, error)
 	Title(ctx context.Context, webDriverEndpoint string, sessionID string) (string, error)
+	Screenshot(ctx context.Context, webDriverEndpoint string, sessionID string) ([]byte, error)
 	Quit(ctx context.Context, webDriverEndpoint string, sessionID string) error
 }
 
 type Manager struct {
-	Store     registry.FileStore
-	Grid      grid.Manager
-	WebDriver WebDriverClient
-	Now       func() time.Time
+	Store         registry.FileStore
+	Grid          grid.Manager
+	WebDriver     WebDriverClient
+	ArtifactStore artifact.Store
+	Now           func() time.Time
 }
 
 type Problem struct {
@@ -144,6 +160,121 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 	}, nil
 }
 
+func (manager Manager) CaptureSessionScreenshot(ctx context.Context, request CaptureSessionRequest) (ScreenshotResult, error) {
+	request = normalizeCaptureSessionRequest(request)
+	if request.SessionID == "" {
+		return ScreenshotResult{}, Problem{Code: "invalid_screenshot_request", Message: "sessionId is required"}
+	}
+	if request.WebDriverEndpoint == "" {
+		return ScreenshotResult{}, Problem{Code: "invalid_screenshot_request", Message: "webdriverEndpoint is required"}
+	}
+	if request.BrowserName == "" {
+		request.BrowserName = "chrome"
+	}
+	if request.BrowserVersion == "" {
+		return ScreenshotResult{}, Problem{Code: "invalid_screenshot_request", Message: "browserVersion is required"}
+	}
+
+	client := manager.webDriverClient()
+	currentURL := request.CurrentURL
+	if currentURL == "" {
+		currentURL, _ = client.CurrentURL(ctx, request.WebDriverEndpoint, request.SessionID)
+	}
+	title := request.Title
+	if title == "" {
+		title, _ = client.Title(ctx, request.WebDriverEndpoint, request.SessionID)
+	}
+	png, err := client.Screenshot(ctx, request.WebDriverEndpoint, request.SessionID)
+	if err != nil {
+		return ScreenshotResult{}, Problem{Code: "screenshot_failed", Message: err.Error()}
+	}
+	return manager.artifactStore().WriteScreenshot(artifact.ScreenshotInput{
+		GroupType:      "session",
+		GroupID:        request.SessionID,
+		SessionID:      request.SessionID,
+		BrowserName:    request.BrowserName,
+		BrowserVersion: request.BrowserVersion,
+		RequestedURL:   request.RequestedURL,
+		CurrentURL:     currentURL,
+		Title:          title,
+		CapturedAt:     manager.now(),
+		PNG:            png,
+	})
+}
+
+func (manager Manager) CaptureScreenshotRun(ctx context.Context, request CreateRequest) (ScreenshotResult, error) {
+	request = normalizeCreateRequest(request)
+	if request.BrowserName == "" {
+		request.BrowserName = "chrome"
+	}
+	if request.URL == "" {
+		request.URL = "about:blank"
+	}
+	if request.BrowserName != "chrome" {
+		return ScreenshotResult{}, Problem{Code: "unsupported_browser", Message: "only Chrome screenshot runs are supported in this slice"}
+	}
+	if request.BrowserVersion == "" {
+		return ScreenshotResult{}, Problem{Code: "invalid_screenshot_request", Message: "browserVersion is required"}
+	}
+
+	records, err := manager.Store.List()
+	if err != nil {
+		return ScreenshotResult{}, err
+	}
+	record, ok := findInstalledBrowser(records, request.BrowserName, request.BrowserVersion)
+	if !ok {
+		return ScreenshotResult{}, Problem{
+			Code:    "browser_not_installed",
+			Message: fmt.Sprintf("%s %s is not installed and enabled in Browser Registry", request.BrowserName, request.BrowserVersion),
+		}
+	}
+	gridStatus, err := manager.ensureGridRunning(ctx, records)
+	if err != nil {
+		return ScreenshotResult{}, err
+	}
+
+	client := manager.webDriverClient()
+	newSession, err := client.NewSession(ctx, NewSessionRequest{
+		WebDriverEndpoint: gridStatus.WebDriverEndpoint,
+		Capabilities:      BuildScreenshotCapabilities(record),
+	})
+	if err != nil {
+		return ScreenshotResult{}, Problem{Code: "webdriver_session_failed", Message: err.Error()}
+	}
+	if newSession.SessionID == "" {
+		return ScreenshotResult{}, Problem{Code: "webdriver_session_failed", Message: "WebDriver did not return a session ID"}
+	}
+	defer func() {
+		_ = client.Quit(context.Background(), gridStatus.WebDriverEndpoint, newSession.SessionID)
+	}()
+
+	if err := client.Navigate(ctx, gridStatus.WebDriverEndpoint, newSession.SessionID, request.URL); err != nil {
+		return ScreenshotResult{}, Problem{Code: "navigation_failed", Message: err.Error()}
+	}
+	currentURL, _ := client.CurrentURL(ctx, gridStatus.WebDriverEndpoint, newSession.SessionID)
+	title, _ := client.Title(ctx, gridStatus.WebDriverEndpoint, newSession.SessionID)
+	png, err := client.Screenshot(ctx, gridStatus.WebDriverEndpoint, newSession.SessionID)
+	if err != nil {
+		return ScreenshotResult{}, Problem{Code: "screenshot_failed", Message: err.Error()}
+	}
+
+	capturedAt := manager.now()
+	runID := fmt.Sprintf("run-%s-%s-%s", capturedAt.UTC().Format("20060102T150405Z"), request.BrowserName, request.BrowserVersion)
+	return manager.artifactStore().WriteScreenshot(artifact.ScreenshotInput{
+		GroupType:      "run",
+		GroupID:        runID,
+		RunID:          runID,
+		SessionID:      newSession.SessionID,
+		BrowserName:    record.Family,
+		BrowserVersion: record.Version,
+		RequestedURL:   request.URL,
+		CurrentURL:     currentURL,
+		Title:          title,
+		CapturedAt:     capturedAt,
+		PNG:            png,
+	})
+}
+
 func BuildCapabilities(record registry.BrowserRecord) map[string]any {
 	family := strings.ToLower(strings.TrimSpace(record.Family))
 	version := strings.TrimSpace(record.Version)
@@ -154,6 +285,15 @@ func BuildCapabilities(record registry.BrowserRecord) map[string]any {
 		"se:name":                "BrowserLab manual " + family + " " + version,
 		"browserlab:sessionType": "manual",
 	}
+}
+
+func BuildScreenshotCapabilities(record registry.BrowserRecord) map[string]any {
+	capabilities := BuildCapabilities(record)
+	family := strings.ToLower(strings.TrimSpace(record.Family))
+	version := strings.TrimSpace(record.Version)
+	capabilities["se:name"] = "BrowserLab screenshot " + family + " " + version
+	capabilities["browserlab:sessionType"] = "screenshot"
+	return capabilities
 }
 
 func ResolveNoVNC(gridURL string, sessionID string, capabilities map[string]any) NoVNCResolution {
@@ -250,6 +390,20 @@ func (client HTTPWebDriverClient) Title(ctx context.Context, webDriverEndpoint s
 	return response.Value, nil
 }
 
+func (client HTTPWebDriverClient) Screenshot(ctx context.Context, webDriverEndpoint string, sessionID string) ([]byte, error) {
+	var response struct {
+		Value string `json:"value"`
+	}
+	if err := client.doJSON(ctx, http.MethodGet, sessionEndpoint(webDriverEndpoint, sessionID, "screenshot"), nil, &response); err != nil {
+		return nil, err
+	}
+	data, err := base64.StdEncoding.DecodeString(response.Value)
+	if err != nil {
+		return nil, fmt.Errorf("decode WebDriver screenshot: %w", err)
+	}
+	return data, nil
+}
+
 func (client HTTPWebDriverClient) Quit(ctx context.Context, webDriverEndpoint string, sessionID string) error {
 	return client.doJSON(ctx, http.MethodDelete, sessionEndpoint(webDriverEndpoint, sessionID, ""), nil, nil)
 }
@@ -319,6 +473,20 @@ func (manager Manager) now() time.Time {
 	return time.Now()
 }
 
+func (manager Manager) webDriverClient() WebDriverClient {
+	if manager.WebDriver != nil {
+		return manager.WebDriver
+	}
+	return HTTPWebDriverClient{Client: http.DefaultClient}
+}
+
+func (manager Manager) artifactStore() artifact.Store {
+	if manager.ArtifactStore.Root != "" {
+		return manager.ArtifactStore
+	}
+	return artifact.Store{}
+}
+
 func findInstalledBrowser(records []registry.BrowserRecord, family string, version string) (registry.BrowserRecord, bool) {
 	for _, record := range records {
 		if !record.Enabled {
@@ -335,6 +503,17 @@ func normalizeCreateRequest(request CreateRequest) CreateRequest {
 	request.BrowserName = strings.ToLower(strings.TrimSpace(request.BrowserName))
 	request.BrowserVersion = strings.TrimSpace(request.BrowserVersion)
 	request.URL = strings.TrimSpace(request.URL)
+	return request
+}
+
+func normalizeCaptureSessionRequest(request CaptureSessionRequest) CaptureSessionRequest {
+	request.SessionID = strings.TrimSpace(request.SessionID)
+	request.BrowserName = strings.ToLower(strings.TrimSpace(request.BrowserName))
+	request.BrowserVersion = strings.TrimSpace(request.BrowserVersion)
+	request.RequestedURL = strings.TrimSpace(request.RequestedURL)
+	request.CurrentURL = strings.TrimSpace(request.CurrentURL)
+	request.Title = strings.TrimSpace(request.Title)
+	request.WebDriverEndpoint = strings.TrimSpace(request.WebDriverEndpoint)
 	return request
 }
 

@@ -148,6 +148,69 @@ final class BrowserSearchViewModelTests: XCTestCase {
         XCTAssertEqual(activeSession?.requestedUrl, "about:blank")
         XCTAssertEqual(activeNoVNCURL?.absoluteString, "http://127.0.0.1:4444/ui/#/sessions/session-123")
     }
+
+    func testCaptureActiveSessionAddsRecentArtifactPreview() async {
+        let session = ManualSessionResponse(
+            sessionId: "session-123",
+            browserName: "chrome",
+            browserVersion: "119.0",
+            requestedUrl: "https://example.test/",
+            currentUrl: "https://example.test/",
+            title: "Example",
+            gridUrl: "http://127.0.0.1:4444",
+            webdriverEndpoint: "http://127.0.0.1:4444/wd/hub",
+            noVnc: .init(url: nil, vncWebSocketUrl: nil, vncLocalAddress: nil, gridSessionUrl: nil),
+            startedAt: "2026-05-20T10:30:00Z"
+        )
+        let installed = InstalledBrowserRecord(
+            family: "chrome",
+            version: "119.0",
+            imageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+            platform: "linux/amd64",
+            source: "selenium-dockerhub",
+            enabled: true
+        )
+        let manager = FakeBrowserManager(
+            searchResponse: .success(.init(browser: "chrome", query: "", results: [])),
+            installResponse: .failure(NSError(domain: "BrowserLab", code: 1)),
+            installedResponse: .success(.init(browsers: [installed]))
+        )
+        let opener = FakeManualSessionOpener(response: .success(session))
+        let capturer = FakeScreenshotCapturer(response: .success(.init(
+            groupType: "session",
+            groupId: "session-123",
+            sessionId: "session-123",
+            runId: nil,
+            browserName: "chrome",
+            browserVersion: "119.0",
+            requestedUrl: "https://example.test/",
+            currentUrl: "https://example.test/",
+            title: "Example",
+            capturedAt: "2026-05-20T10:31:00Z",
+            groupDir: "/tmp/BrowserLab/artifacts/sessions/session-123",
+            screenshotPath: "/tmp/BrowserLab/artifacts/sessions/session-123/20260520T103100Z-screenshot.png",
+            metadataPath: "/tmp/BrowserLab/artifacts/sessions/session-123/20260520T103100Z-metadata.json",
+            resultPath: "/tmp/BrowserLab/artifacts/sessions/session-123/20260520T103100Z-result.json",
+            summaryPath: "/tmp/BrowserLab/artifacts/sessions/session-123/20260520T103100Z-summary.md"
+        )))
+        let viewModel = await BrowserSearchViewModel(
+            client: manager,
+            lister: manager,
+            sessionOpener: opener,
+            screenshotCapturer: capturer
+        )
+
+        await viewModel.refreshInstalledBrowsers()
+        let rows = await viewModel.installedRows
+        await viewModel.openManualSession(record: rows[0].record)
+        await viewModel.captureActiveSessionScreenshot()
+
+        let recentArtifacts = await viewModel.recentArtifacts
+        XCTAssertEqual(capturer.capturedSession?.sessionId, "session-123")
+        XCTAssertEqual(recentArtifacts.count, 1)
+        XCTAssertEqual(recentArtifacts[0].title, "Chrome 119.0 - 2026-05-20T10:31:00Z")
+        XCTAssertTrue(recentArtifacts[0].detail.contains("20260520T103100Z-screenshot.png"))
+    }
 }
 
 private struct FakeBrowserSearchClient: BrowserVersionSearching {
@@ -188,6 +251,20 @@ private final class FakeManualSessionOpener: ManualSessionOpening {
     func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse {
         requestedBrowser = browser
         requestedURL = url
+        return try response.get()
+    }
+}
+
+private final class FakeScreenshotCapturer: ScreenshotCapturing {
+    let response: Result<ScreenshotArtifact, Error>
+    private(set) var capturedSession: ManualSessionResponse?
+
+    init(response: Result<ScreenshotArtifact, Error>) {
+        self.response = response
+    }
+
+    func captureSessionScreenshot(session: ManualSessionResponse) async throws -> ScreenshotArtifact {
+        capturedSession = session
         return try response.get()
     }
 }

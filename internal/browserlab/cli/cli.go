@@ -53,6 +53,8 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 		return runGrid(args[1:], stdout, stderr)
 	case "session":
 		return runSession(args[1:], stdout, stderr)
+	case "screenshot":
+		return runScreenshot(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		writeUsage(stdout)
 		return 0
@@ -69,6 +71,8 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "       browserlab browsers [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab grid <start|stop|status|config> [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab session open chrome VERSION [URL] [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab session screenshot SESSION_ID --browser chrome --version VERSION --webdriver-endpoint URL [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab screenshot chrome VERSION URL [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
 }
 
@@ -221,6 +225,8 @@ func runSession(args []string, stdout io.Writer, stderr io.Writer) int {
 	switch command {
 	case "open":
 		return runSessionOpen(args[1:], stdout, stderr)
+	case "screenshot":
+		return runSessionScreenshot(args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "unknown session command: %s\n", command)
 		return 64
@@ -258,6 +264,76 @@ func runSessionOpen(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 0
 	}
 	writeManualSessionHuman(stdout, result)
+	return 0
+}
+
+func runSessionScreenshot(args []string, stdout io.Writer, stderr io.Writer) int {
+	parsed, err := parseSessionScreenshotArgs(args)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "usage: browserlab session screenshot SESSION_ID --browser chrome --version VERSION --webdriver-endpoint URL [--json] [--base-url URL]")
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	result, err := captureSessionScreenshot(ctx, parsed.baseURL, appSupport.Token, api.SessionScreenshotRequest{
+		SessionID:         parsed.sessionID,
+		BrowserName:       parsed.browser,
+		BrowserVersion:    parsed.version,
+		RequestedURL:      parsed.requestedURL,
+		WebDriverEndpoint: parsed.webDriverEndpoint,
+	})
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "screenshot_failed", err.Error())
+		return 2
+	}
+	if parsed.jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(result)
+		return 0
+	}
+	writeScreenshotHuman(stdout, result)
+	return 0
+}
+
+func runScreenshot(args []string, stdout io.Writer, stderr io.Writer) int {
+	parsed, err := parseScreenshotRunArgs(args)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "usage: browserlab screenshot chrome VERSION URL [--json] [--base-url URL]")
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	result, err := captureScreenshotRun(ctx, parsed.baseURL, appSupport.Token, api.ScreenshotRunRequest{
+		BrowserName:    parsed.browser,
+		BrowserVersion: parsed.version,
+		URL:            parsed.url,
+	})
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "screenshot_failed", err.Error())
+		return 2
+	}
+	if parsed.jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(result)
+		return 0
+	}
+	writeScreenshotHuman(stdout, result)
 	return 0
 }
 
@@ -636,6 +712,62 @@ func createManualSession(ctx context.Context, baseURL string, token string, requ
 	return result, nil
 }
 
+func captureSessionScreenshot(ctx context.Context, baseURL string, token string, request api.SessionScreenshotRequest) (api.ScreenshotResponse, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/sessions/screenshot", bytes.NewReader(data))
+	if err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.ScreenshotResponse{}, decodeProblem(resp)
+	}
+
+	var result api.ScreenshotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	return result, nil
+}
+
+func captureScreenshotRun(ctx context.Context, baseURL string, token string, request api.ScreenshotRunRequest) (api.ScreenshotResponse, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/screenshots/run", bytes.NewReader(data))
+	if err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.ScreenshotResponse{}, decodeProblem(resp)
+	}
+
+	var result api.ScreenshotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.ScreenshotResponse{}, err
+	}
+	return result, nil
+}
+
 func decodeProblem(resp *http.Response) error {
 	var problem api.StatusProblem
 	if err := json.NewDecoder(resp.Body).Decode(&problem); err == nil && problem.Message != "" {
@@ -681,6 +813,116 @@ type sessionOpenArgs struct {
 	url        string
 	jsonOutput bool
 	baseURL    string
+}
+
+type sessionScreenshotArgs struct {
+	sessionID         string
+	browser           string
+	version           string
+	requestedURL      string
+	webDriverEndpoint string
+	jsonOutput        bool
+	baseURL           string
+}
+
+type screenshotRunArgs struct {
+	browser    string
+	version    string
+	url        string
+	jsonOutput bool
+	baseURL    string
+}
+
+func parseSessionScreenshotArgs(args []string) (sessionScreenshotArgs, error) {
+	parsed := sessionScreenshotArgs{baseURL: defaultBaseURL, browser: "chrome"}
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			parsed.jsonOutput = true
+		case "--base-url":
+			if i+1 >= len(args) {
+				return sessionScreenshotArgs{}, fmt.Errorf("--base-url requires a URL")
+			}
+			parsed.baseURL = args[i+1]
+			i++
+		case "--browser":
+			if i+1 >= len(args) {
+				return sessionScreenshotArgs{}, fmt.Errorf("--browser requires a value")
+			}
+			parsed.browser = strings.ToLower(args[i+1])
+			i++
+		case "--version":
+			if i+1 >= len(args) {
+				return sessionScreenshotArgs{}, fmt.Errorf("--version requires a value")
+			}
+			parsed.version = args[i+1]
+			i++
+		case "--requested-url":
+			if i+1 >= len(args) {
+				return sessionScreenshotArgs{}, fmt.Errorf("--requested-url requires a URL")
+			}
+			parsed.requestedURL = args[i+1]
+			i++
+		case "--webdriver-endpoint":
+			if i+1 >= len(args) {
+				return sessionScreenshotArgs{}, fmt.Errorf("--webdriver-endpoint requires a URL")
+			}
+			parsed.webDriverEndpoint = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return sessionScreenshotArgs{}, fmt.Errorf("unknown flag: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 1 {
+		return sessionScreenshotArgs{}, fmt.Errorf("session ID is required")
+	}
+	if parsed.browser != "chrome" {
+		return sessionScreenshotArgs{}, fmt.Errorf("only chrome screenshots are supported")
+	}
+	if parsed.version == "" {
+		return sessionScreenshotArgs{}, fmt.Errorf("--version is required")
+	}
+	if parsed.webDriverEndpoint == "" {
+		return sessionScreenshotArgs{}, fmt.Errorf("--webdriver-endpoint is required")
+	}
+	parsed.sessionID = positionals[0]
+	return parsed, nil
+}
+
+func parseScreenshotRunArgs(args []string) (screenshotRunArgs, error) {
+	parsed := screenshotRunArgs{baseURL: defaultBaseURL}
+	var positionals []string
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			parsed.jsonOutput = true
+		case "--base-url":
+			if i+1 >= len(args) {
+				return screenshotRunArgs{}, fmt.Errorf("--base-url requires a URL")
+			}
+			parsed.baseURL = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return screenshotRunArgs{}, fmt.Errorf("unknown flag: %s", args[i])
+			}
+			positionals = append(positionals, args[i])
+		}
+	}
+	if len(positionals) != 3 {
+		return screenshotRunArgs{}, fmt.Errorf("browser, version, and URL are required")
+	}
+	if strings.ToLower(positionals[0]) != "chrome" {
+		return screenshotRunArgs{}, fmt.Errorf("only chrome screenshots are supported")
+	}
+	parsed.browser = "chrome"
+	parsed.version = positionals[1]
+	parsed.url = positionals[2]
+	return parsed, nil
 }
 
 func parseSessionOpenArgs(args []string) (sessionOpenArgs, error) {
@@ -911,6 +1153,23 @@ func writeManualSessionHuman(stdout io.Writer, result api.ManualSessionResponse)
 	if result.NoVNC.VNCWebSocketURL != "" {
 		fmt.Fprintf(stdout, "VNC websocket: %s\n", result.NoVNC.VNCWebSocketURL)
 	}
+}
+
+func writeScreenshotHuman(stdout io.Writer, result api.ScreenshotResponse) {
+	fmt.Fprintln(stdout, "Screenshot artifact:")
+	if result.GroupType != "" {
+		fmt.Fprintf(stdout, "Group: %s/%s\n", result.GroupType, result.GroupID)
+	}
+	if result.SessionID != "" {
+		fmt.Fprintf(stdout, "Session: %s\n", result.SessionID)
+	}
+	if result.RunID != "" {
+		fmt.Fprintf(stdout, "Run: %s\n", result.RunID)
+	}
+	fmt.Fprintf(stdout, "Screenshot: %s\n", result.ScreenshotPath)
+	fmt.Fprintf(stdout, "Metadata: %s\n", result.MetadataPath)
+	fmt.Fprintf(stdout, "Result: %s\n", result.ResultPath)
+	fmt.Fprintf(stdout, "Summary: %s\n", result.SummaryPath)
 }
 
 func displayBrowserName(name string) string {
