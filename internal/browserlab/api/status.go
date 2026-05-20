@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -8,25 +9,28 @@ import (
 	"time"
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 )
 
 const DefaultListenAddr = "127.0.0.1:49321"
 
 type ServerOptions struct {
-	AppSupport config.AppSupport
-	ListenAddr string
-	Version    string
+	AppSupport     config.AppSupport
+	ListenAddr     string
+	Version        string
+	NativeRuntimes []native.RuntimeStatus
 }
 
 type StatusResponse struct {
-	State     string         `json:"state"`
-	Service   string         `json:"service"`
-	Version   string         `json:"version"`
-	CheckedAt string         `json:"checkedAt"`
-	API       APIStatus      `json:"api"`
-	Paths     PathStatus     `json:"paths"`
-	Checks    []StatusCheck  `json:"checks"`
-	Error     *StatusProblem `json:"error,omitempty"`
+	State          string                 `json:"state"`
+	Service        string                 `json:"service"`
+	Version        string                 `json:"version"`
+	CheckedAt      string                 `json:"checkedAt"`
+	API            APIStatus              `json:"api"`
+	Paths          PathStatus             `json:"paths"`
+	Checks         []StatusCheck          `json:"checks"`
+	NativeRuntimes []native.RuntimeStatus `json:"nativeRuntimes"`
+	Error          *StatusProblem         `json:"error,omitempty"`
 }
 
 type APIStatus struct {
@@ -86,6 +90,13 @@ func NewStatusResponse(options ServerOptions) StatusResponse {
 	if options.Version == "" {
 		options.Version = "dev"
 	}
+	nativeRuntimes := options.NativeRuntimes
+	if nativeRuntimes == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		nativeRuntimes = native.DetectAll(ctx)
+	}
+
 	return StatusResponse{
 		State:     "running",
 		Service:   "browserlabd",
@@ -105,6 +116,7 @@ func NewStatusResponse(options ServerOptions) StatusResponse {
 			State:   "ok",
 			Message: "daemon is reachable",
 		}},
+		NativeRuntimes: nativeRuntimes,
 	}
 }
 

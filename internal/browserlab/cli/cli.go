@@ -12,6 +12,7 @@ import (
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 )
 
 const defaultBaseURL = "http://" + api.DefaultListenAddr
@@ -65,7 +66,34 @@ func runStatus(args []string, stdout io.Writer, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "BrowserLab daemon: %s\n", status.State)
 	fmt.Fprintf(stdout, "API: %s\n", status.API.Bind)
 	fmt.Fprintf(stdout, "Config: %s\n", status.Paths.ConfigDir)
+	writeNativeRuntimes(stdout, status.NativeRuntimes)
 	return 0
+}
+
+func writeNativeRuntimes(stdout io.Writer, runtimes []native.RuntimeStatus) {
+	if len(runtimes) == 0 {
+		return
+	}
+	fmt.Fprintln(stdout, "Native runtimes:")
+	for _, runtime := range runtimes {
+		installable := "non-installable"
+		if runtime.Installable {
+			installable = "installable"
+		}
+		fmt.Fprintf(stdout, "- %s: %s (%s, %s)\n", runtime.DisplayName, runtime.Status, runtime.Kind, installable)
+		if runtime.BrowserVersion != "" {
+			fmt.Fprintf(stdout, "  Safari version: %s\n", runtime.BrowserVersion)
+		}
+		if runtime.DriverVersion != "" {
+			fmt.Fprintf(stdout, "  SafariDriver: %s\n", runtime.DriverVersion)
+		}
+		for _, guidance := range runtime.SetupGuidance {
+			fmt.Fprintf(stdout, "  Setup: %s\n", guidance)
+		}
+		if runtime.OutOfScope != "" {
+			fmt.Fprintf(stdout, "  Scope: %s\n", runtime.OutOfScope)
+		}
+	}
 }
 
 func fetchStatus(ctx context.Context, baseURL string, token string) (api.StatusResponse, error) {

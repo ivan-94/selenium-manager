@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 )
 
 func TestStatusEndpointRequiresLocalTokenAndReturnsDaemonStatus(t *testing.T) {
@@ -20,6 +21,20 @@ func TestStatusEndpointRequiresLocalTokenAndReturnsDaemonStatus(t *testing.T) {
 		AppSupport: appSupport,
 		ListenAddr: "127.0.0.1:49321",
 		Version:    "test-version",
+		NativeRuntimes: []native.RuntimeStatus{{
+			ID:               "safari",
+			DisplayName:      "Safari",
+			Kind:             "native",
+			Installable:      false,
+			Status:           "ready",
+			BrowserAvailable: true,
+			BrowserVersion:   "17.5",
+			DriverAvailable:  true,
+			DriverVersion:    "Included with Safari 17.5",
+			Message:          "Current macOS Safari is available as a native, non-installable runtime.",
+			SetupGuidance:    []string{"Use the current macOS Safari for native checks."},
+			OutOfScope:       native.SafariOldVersionsOutOfScope,
+		}},
 	}))
 	t.Cleanup(server.Close)
 
@@ -62,6 +77,16 @@ func TestStatusEndpointRequiresLocalTokenAndReturnsDaemonStatus(t *testing.T) {
 	}
 	if status.Paths.ConfigDir != appSupport.Paths.ConfigDir {
 		t.Fatalf("config dir = %q, want %q", status.Paths.ConfigDir, appSupport.Paths.ConfigDir)
+	}
+	if len(status.NativeRuntimes) != 1 {
+		t.Fatalf("native runtimes = %d, want 1", len(status.NativeRuntimes))
+	}
+	safari := status.NativeRuntimes[0]
+	if safari.ID != "safari" || safari.Kind != "native" || safari.Installable {
+		t.Fatalf("safari runtime = %+v, want native non-installable safari", safari)
+	}
+	if safari.OutOfScope != native.SafariOldVersionsOutOfScope {
+		t.Fatalf("safari outOfScope = %q, want old Safari out-of-scope copy", safari.OutOfScope)
 	}
 }
 
