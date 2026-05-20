@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"testing"
 	"time"
@@ -99,6 +100,138 @@ func TestManagerCreateHeldSessionDefaultsURLAndDoesNotQuit(t *testing.T) {
 	}
 }
 
+func TestManagerListsAndClosesHeldSessions(t *testing.T) {
+	store := registry.NewFileStore(t.TempDir())
+	_, err := store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &recordingWebDriver{
+		sessionID: "session-123",
+		capabilities: map[string]any{
+			"se:vnc": "ws://172.17.0.2:4444/session/session-123/se/vnc",
+		},
+		currentURL: "https://example.test/",
+		title:      "Example",
+	}
+	manager := Manager{
+		Store:          store,
+		Grid:           grid.Manager{Root: t.TempDir(), Runner: &runningGridRunner{}},
+		WebDriver:      webdriver,
+		ActiveSessions: NewMemoryStore(),
+		Now:            func() time.Time { return time.Date(2026, 5, 20, 10, 30, 0, 0, time.UTC) },
+	}
+
+	created, err := manager.CreateHeldSession(context.Background(), CreateRequest{
+		BrowserName:    "chrome",
+		BrowserVersion: "119.0",
+		URL:            "https://example.test/",
+	})
+	if err != nil {
+		t.Fatalf("CreateHeldSession() error = %v", err)
+	}
+	if created.Status != StatusActive {
+		t.Fatalf("created status = %q, want active", created.Status)
+	}
+
+	list, err := manager.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if len(list.Sessions) != 1 {
+		t.Fatalf("sessions = %+v, want one active session", list.Sessions)
+	}
+	active := list.Sessions[0]
+	if active.SessionID != "session-123" || active.BrowserVersion != "119.0" {
+		t.Fatalf("active session = %+v, want chrome 119.0 session", active)
+	}
+	if active.Status != StatusActive || active.CurrentURL != "https://example.test/" || active.Title != "Example" {
+		t.Fatalf("active state = %+v, want active page metadata", active)
+	}
+	if active.NoVNC.URL != "http://127.0.0.1:4444/ui/#/sessions/session-123" {
+		t.Fatalf("noVNC URL = %q", active.NoVNC.URL)
+	}
+
+	closed, err := manager.CloseSession(context.Background(), "session-123")
+	if err != nil {
+		t.Fatalf("CloseSession() error = %v", err)
+	}
+	if closed.Session.Status != StatusClosed {
+		t.Fatalf("closed status = %q, want closed", closed.Session.Status)
+	}
+	if !webdriver.quitCalled {
+		t.Fatal("CloseSession() did not call WebDriver Quit")
+	}
+
+	list, err = manager.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions() after close error = %v", err)
+	}
+	if len(list.Sessions) != 0 {
+		t.Fatalf("sessions after close = %+v, want none", list.Sessions)
+	}
+}
+
+func TestManagerMarksExternallyClosedSessionsStale(t *testing.T) {
+	store := registry.NewFileStore(t.TempDir())
+	_, err := store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &recordingWebDriver{
+		sessionID:  "session-123",
+		currentURL: "https://example.test/",
+		title:      "Example",
+	}
+	manager := Manager{
+		Store:          store,
+		Grid:           grid.Manager{Root: t.TempDir(), Runner: &runningGridRunner{}},
+		WebDriver:      webdriver,
+		ActiveSessions: NewMemoryStore(),
+		Now:            func() time.Time { return time.Date(2026, 5, 20, 10, 30, 0, 0, time.UTC) },
+	}
+	if _, err := manager.CreateHeldSession(context.Background(), CreateRequest{
+		BrowserName:    "chrome",
+		BrowserVersion: "119.0",
+		URL:            "https://example.test/",
+	}); err != nil {
+		t.Fatalf("CreateHeldSession() error = %v", err)
+	}
+
+	webdriver.currentURLErr = errors.New("invalid session id")
+	list, err := manager.ListSessions(context.Background())
+	if err != nil {
+		t.Fatalf("ListSessions() error = %v", err)
+	}
+	if len(list.Sessions) != 1 {
+		t.Fatalf("sessions = %+v, want one stale session", list.Sessions)
+	}
+	if list.Sessions[0].Status != StatusStale {
+		t.Fatalf("status = %q, want stale", list.Sessions[0].Status)
+	}
+
+	if _, err := manager.CloseSession(context.Background(), "session-123"); err != nil {
+		t.Fatalf("CloseSession(stale) error = %v", err)
+	}
+	if webdriver.quitCalled {
+		t.Fatal("stale close should remove local record without calling WebDriver Quit")
+	}
+}
+
 func TestResolveNoVNCUsesGridURLForRoutedVNCWebSocket(t *testing.T) {
 	resolution := ResolveNoVNC("http://127.0.0.1:4444", "session-123", map[string]any{
 		"se:vnc":             "ws://172.17.0.2:4444/session/session-123/se/vnc",
@@ -121,6 +254,8 @@ type recordingWebDriver struct {
 	capabilities       map[string]any
 	currentURL         string
 	title              string
+	currentURLErr      error
+	titleErr           error
 	newSessionEndpoint string
 	navigatedURL       string
 	quitCalled         bool
@@ -137,10 +272,16 @@ func (driver *recordingWebDriver) Navigate(_ context.Context, _ string, _ string
 }
 
 func (driver *recordingWebDriver) CurrentURL(_ context.Context, _ string, _ string) (string, error) {
+	if driver.currentURLErr != nil {
+		return "", driver.currentURLErr
+	}
 	return driver.currentURL, nil
 }
 
 func (driver *recordingWebDriver) Title(_ context.Context, _ string, _ string) (string, error) {
+	if driver.titleErr != nil {
+		return "", driver.titleErr
+	}
 	return driver.title, nil
 }
 

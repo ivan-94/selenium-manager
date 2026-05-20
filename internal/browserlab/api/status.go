@@ -94,6 +94,12 @@ type GridConfigResponse struct {
 
 type ManualSessionRequest = browserlabsession.CreateRequest
 type ManualSessionResponse = browserlabsession.CreateResponse
+type SessionListResponse = browserlabsession.ListResponse
+type SessionCloseResponse = browserlabsession.CloseResponse
+
+type SessionInspectResponse struct {
+	Session browserlabsession.Record `json:"session"`
+}
 
 func NewHandler(options ServerOptions) http.Handler {
 	if options.ListenAddr == "" {
@@ -121,9 +127,10 @@ func NewHandler(options ServerOptions) http.Handler {
 		Runner: options.GridRunner,
 	}
 	sessionManager := browserlabsession.Manager{
-		Store:     registryStore,
-		Grid:      gridManager,
-		WebDriver: options.WebDriverClient,
+		Store:          registryStore,
+		Grid:           gridManager,
+		WebDriver:      options.WebDriverClient,
+		ActiveSessions: browserlabsession.NewMemoryStore(),
 	}
 	browserManager := browser.Manager{
 		Store:          registryStore,
@@ -387,6 +394,51 @@ func NewHandler(options ServerOptions) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
+	mux.HandleFunc("GET /v1/sessions", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		result, err := sessionManager.ListSessions(r.Context())
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("GET /v1/sessions/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		result, err := sessionManager.InspectSession(r.Context(), r.PathValue("sessionID"))
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, SessionInspectResponse{Session: result})
+	})
+	mux.HandleFunc("DELETE /v1/sessions/{sessionID}", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		result, err := sessionManager.CloseSession(r.Context(), r.PathValue("sessionID"))
+		if err != nil {
+			writeSessionError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
 	return mux
 }
 
@@ -488,6 +540,8 @@ func writeSessionError(w http.ResponseWriter, err error) {
 		switch problem.Code {
 		case "webdriver_session_failed", "navigation_failed":
 			status = http.StatusBadGateway
+		case "session_not_found":
+			status = http.StatusNotFound
 		}
 		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
 		return

@@ -637,6 +637,94 @@ func TestSessionOpenHumanPrintsSessionDetails(t *testing.T) {
 	}
 }
 
+func TestSessionsListInspectCloseJSONAndNotFoundExitCode(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &cliWebDriver{
+		sessionID:  "session-123",
+		currentURL: "https://example.test/",
+		title:      "Example",
+		capabilities: map[string]any{
+			"se:vnc": "ws://172.17.0.2:4444/session/session-123/se/vnc",
+		},
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:      appSupport,
+		GridRunner:      &cliGridRunner{running: true},
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	var openStdout bytes.Buffer
+	if exitCode := Run([]string{"session", "open", "chrome", "119.0", "https://example.test/", "--json", "--base-url", server.URL}, &openStdout, &bytes.Buffer{}); exitCode != 0 {
+		t.Fatalf("Run(session open --json) exit = %d, want 0; output %s", exitCode, openStdout.String())
+	}
+
+	var listStdout bytes.Buffer
+	if exitCode := Run([]string{"sessions", "list", "--json", "--base-url", server.URL}, &listStdout, &bytes.Buffer{}); exitCode != 0 {
+		t.Fatalf("Run(sessions list --json) exit = %d, want 0; output %s", exitCode, listStdout.String())
+	}
+	var list api.SessionListResponse
+	if err := json.Unmarshal(listStdout.Bytes(), &list); err != nil {
+		t.Fatalf("sessions list JSON was invalid: %v\n%s", err, listStdout.String())
+	}
+	if len(list.Sessions) != 1 || list.Sessions[0].Status != browserlabsession.StatusActive {
+		t.Fatalf("sessions list = %+v, want one active session", list.Sessions)
+	}
+
+	var inspectStdout bytes.Buffer
+	if exitCode := Run([]string{"sessions", "inspect", "session-123", "--json", "--base-url", server.URL}, &inspectStdout, &bytes.Buffer{}); exitCode != 0 {
+		t.Fatalf("Run(sessions inspect --json) exit = %d, want 0; output %s", exitCode, inspectStdout.String())
+	}
+	var inspected api.SessionInspectResponse
+	if err := json.Unmarshal(inspectStdout.Bytes(), &inspected); err != nil {
+		t.Fatalf("sessions inspect JSON was invalid: %v\n%s", err, inspectStdout.String())
+	}
+	if inspected.Session.Title != "Example" || inspected.Session.NoVNC.URL == "" {
+		t.Fatalf("inspected = %+v, want title and noVNC data", inspected.Session)
+	}
+
+	var closeStdout bytes.Buffer
+	if exitCode := Run([]string{"sessions", "close", "session-123", "--json", "--base-url", server.URL}, &closeStdout, &bytes.Buffer{}); exitCode != 0 {
+		t.Fatalf("Run(sessions close --json) exit = %d, want 0; output %s", exitCode, closeStdout.String())
+	}
+	var closed api.SessionCloseResponse
+	if err := json.Unmarshal(closeStdout.Bytes(), &closed); err != nil {
+		t.Fatalf("sessions close JSON was invalid: %v\n%s", err, closeStdout.String())
+	}
+	if closed.Session.Status != browserlabsession.StatusClosed || !webdriver.quitCalled {
+		t.Fatalf("closed = %+v quitCalled=%v, want closed and quit", closed.Session, webdriver.quitCalled)
+	}
+
+	var missingStdout bytes.Buffer
+	exitCode := Run([]string{"sessions", "inspect", "missing-session", "--json", "--base-url", server.URL}, &missingStdout, &bytes.Buffer{})
+	if exitCode != 3 {
+		t.Fatalf("Run(sessions inspect missing --json) exit = %d, want 3; output %s", exitCode, missingStdout.String())
+	}
+	var problem api.StatusProblem
+	if err := json.Unmarshal(missingStdout.Bytes(), &problem); err != nil {
+		t.Fatalf("missing problem JSON was invalid: %v\n%s", err, missingStdout.String())
+	}
+	if problem.Code != "session_not_found" {
+		t.Fatalf("problem = %+v, want session_not_found", problem)
+	}
+}
+
 type cliRecordingPuller struct {
 	requests []install.PullRequest
 }

@@ -160,6 +160,7 @@ public struct ManualSessionResponse: Decodable, Equatable {
     public let webdriverEndpoint: String
     public let noVnc: NoVNCResolution
     public let startedAt: String
+    public let status: String
 
     public init(
         sessionId: String,
@@ -171,7 +172,8 @@ public struct ManualSessionResponse: Decodable, Equatable {
         gridUrl: String,
         webdriverEndpoint: String,
         noVnc: NoVNCResolution,
-        startedAt: String
+        startedAt: String,
+        status: String = "active"
     ) {
         self.sessionId = sessionId
         self.browserName = browserName
@@ -183,6 +185,7 @@ public struct ManualSessionResponse: Decodable, Equatable {
         self.webdriverEndpoint = webdriverEndpoint
         self.noVnc = noVnc
         self.startedAt = startedAt
+        self.status = status
     }
 }
 
@@ -216,7 +219,31 @@ public protocol InstalledBrowserUninstalling {
     func uninstallBrowser(record: InstalledBrowserRecord, deleteImage: Bool, confirmDeleteImage: Bool) async throws -> BrowserUninstallResponse
 }
 
-public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening, InstalledBrowserDisabling, InstalledBrowserUninstalling {
+public struct SessionListResponse: Decodable, Equatable {
+    public let sessions: [ManualSessionResponse]
+
+    public init(sessions: [ManualSessionResponse]) {
+        self.sessions = sessions
+    }
+}
+
+public struct SessionCloseResponse: Decodable, Equatable {
+    public let session: ManualSessionResponse
+
+    public init(session: ManualSessionResponse) {
+        self.session = session
+    }
+}
+
+public protocol ActiveSessionListing {
+    func listActiveSessions() async throws -> SessionListResponse
+}
+
+public protocol SessionClosing {
+    func closeSession(sessionId: String) async throws -> SessionCloseResponse
+}
+
+public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening, InstalledBrowserDisabling, InstalledBrowserUninstalling, ActiveSessionListing, SessionClosing {
     private let baseURL: URL
     private let tokenFile: URL
     private let session: URLSession
@@ -384,6 +411,46 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
         return try JSONDecoder().decode(BrowserUninstallResponse.self, from: data)
     }
 
+    public func listActiveSessions() async throws -> SessionListResponse {
+        let token = try readToken()
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1")
+                .appendingPathComponent("sessions")
+        )
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw DaemonStatusClientError.badHTTPStatus(-1)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(SessionListResponse.self, from: data)
+    }
+
+    public func closeSession(sessionId: String) async throws -> SessionCloseResponse {
+        let token = try readToken()
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1")
+                .appendingPathComponent("sessions")
+                .appendingPathComponent(sessionId)
+        )
+        request.httpMethod = "DELETE"
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw DaemonStatusClientError.badHTTPStatus(-1)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(SessionCloseResponse.self, from: data)
+    }
+
     private func readToken() throws -> String {
         do {
             return try String(contentsOf: tokenFile, encoding: .utf8)
@@ -462,6 +529,14 @@ public struct InstalledBrowserRow: Equatable, Identifiable {
     public let record: InstalledBrowserRecord
 }
 
+public struct ActiveSessionRow: Equatable, Identifiable {
+    public let id: String
+    public let title: String
+    public let detail: String
+    public let noVNCURL: URL?
+    public let session: ManualSessionResponse
+}
+
 @MainActor
 public final class BrowserSearchViewModel: ObservableObject {
     @Published public var query: String = ""
@@ -472,10 +547,12 @@ public final class BrowserSearchViewModel: ObservableObject {
     @Published public private(set) var openingImageTag: String?
     @Published public var targetURL: String = ""
     @Published public private(set) var activeSession: ManualSessionResponse?
+    @Published public private(set) var activeSessionRows: [ActiveSessionRow] = []
     @Published public private(set) var installMessages: [String: String] = [:]
     @Published public private(set) var installedMessages: [String: String] = [:]
     @Published public var deleteImageOnUninstall: Bool = false
     @Published public var confirmDeleteImage: Bool = false
+    @Published public private(set) var closingSessionID: String?
     @Published public private(set) var errorMessage: String?
 
     private let client: BrowserVersionSearching
@@ -484,6 +561,8 @@ public final class BrowserSearchViewModel: ObservableObject {
     private let sessionOpener: ManualSessionOpening?
     private let disabler: InstalledBrowserDisabling?
     private let uninstaller: InstalledBrowserUninstalling?
+    private let sessionLister: ActiveSessionListing?
+    private let sessionCloser: SessionClosing?
 
     public init(
         client: BrowserVersionSearching,
@@ -491,7 +570,9 @@ public final class BrowserSearchViewModel: ObservableObject {
         lister: InstalledBrowserListing? = nil,
         sessionOpener: ManualSessionOpening? = nil,
         disabler: InstalledBrowserDisabling? = nil,
-        uninstaller: InstalledBrowserUninstalling? = nil
+        uninstaller: InstalledBrowserUninstalling? = nil,
+        sessionLister: ActiveSessionListing? = nil,
+        sessionCloser: SessionClosing? = nil
     ) {
         self.client = client
         self.installer = installer
@@ -499,6 +580,8 @@ public final class BrowserSearchViewModel: ObservableObject {
         self.sessionOpener = sessionOpener
         self.disabler = disabler
         self.uninstaller = uninstaller
+        self.sessionLister = sessionLister
+        self.sessionCloser = sessionCloser
     }
 
     public func search(query: String? = nil) async {
@@ -523,6 +606,15 @@ public final class BrowserSearchViewModel: ObservableObject {
         guard let lister else { return }
         do {
             installedRows = try await lister.listInstalledBrowsers().browsers.map(Self.installedRow)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func refreshActiveSessions() async {
+        guard let sessionLister else { return }
+        do {
+            activeSessionRows = try await sessionLister.listActiveSessions().sessions.map(Self.activeSessionRow)
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -563,6 +655,24 @@ public final class BrowserSearchViewModel: ObservableObject {
                 browser: record,
                 url: trimmedURL.isEmpty ? nil : trimmedURL
             )
+            await refreshActiveSessions()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    public func closeSession(sessionId: String) async {
+        guard let sessionCloser else { return }
+        closingSessionID = sessionId
+        errorMessage = nil
+        defer { closingSessionID = nil }
+
+        do {
+            _ = try await sessionCloser.closeSession(sessionId: sessionId)
+            if activeSession?.sessionId == sessionId {
+                activeSession = nil
+            }
+            await refreshActiveSessions()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -646,6 +756,32 @@ public final class BrowserSearchViewModel: ObservableObject {
             enabled: record.enabled,
             record: record
         )
+    }
+
+    private static func activeSessionRow(for session: ManualSessionResponse) -> ActiveSessionRow {
+        var detail = [
+            "Browser: \(displayBrowserName(session.browserName)) \(session.browserVersion)",
+            "Status: \(session.status)",
+            "Started: \(session.startedAt)"
+        ]
+        if let currentURL = session.currentUrl, !currentURL.isEmpty {
+            detail.append("URL: \(currentURL)")
+        }
+        if let title = session.title, !title.isEmpty {
+            detail.append("Title: \(title)")
+        }
+        return ActiveSessionRow(
+            id: session.sessionId,
+            title: "Session \(session.sessionId)",
+            detail: detail.joined(separator: "\n"),
+            noVNCURL: session.noVnc.url.flatMap(URL.init(string:)),
+            session: session
+        )
+    }
+
+    private static func displayBrowserName(_ name: String) -> String {
+        guard let first = name.first else { return name }
+        return first.uppercased() + name.dropFirst()
     }
 }
 
@@ -756,6 +892,34 @@ public struct BrowserSearchView: View {
                 }
                 .frame(minHeight: 120)
             }
+            if !viewModel.activeSessionRows.isEmpty {
+                Text("Active Sessions")
+                    .font(.headline)
+                List(viewModel.activeSessionRows) { row in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text(row.title)
+                                .font(.headline)
+                            Spacer()
+                            if let url = row.noVNCURL {
+                                Link("Open", destination: url)
+                            }
+                            Button(viewModel.closingSessionID == row.id ? "Closing" : "Close") {
+                                Task {
+                                    await viewModel.closeSession(sessionId: row.id)
+                                }
+                            }
+                            .disabled(viewModel.closingSessionID == row.id)
+                        }
+                        Text(row.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    .padding(.vertical, 4)
+                }
+                .frame(minHeight: 120)
+            }
             if let session = viewModel.activeSession {
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -781,6 +945,7 @@ public struct BrowserSearchView: View {
         }
         .task {
             await viewModel.refreshInstalledBrowsers()
+            await viewModel.refreshActiveSessions()
         }
     }
 }

@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
@@ -21,7 +23,15 @@ type CreateRequest struct {
 	URL            string `json:"url,omitempty"`
 }
 
-type CreateResponse struct {
+type Status string
+
+const (
+	StatusActive Status = "active"
+	StatusStale  Status = "stale"
+	StatusClosed Status = "closed"
+)
+
+type Record struct {
 	SessionID         string          `json:"sessionId"`
 	BrowserName       string          `json:"browserName"`
 	BrowserVersion    string          `json:"browserVersion"`
@@ -32,6 +42,17 @@ type CreateResponse struct {
 	WebDriverEndpoint string          `json:"webdriverEndpoint"`
 	NoVNC             NoVNCResolution `json:"noVnc"`
 	StartedAt         string          `json:"startedAt"`
+	Status            Status          `json:"status"`
+}
+
+type CreateResponse = Record
+
+type ListResponse struct {
+	Sessions []Record `json:"sessions"`
+}
+
+type CloseResponse struct {
+	Session Record `json:"session"`
 }
 
 type NoVNCResolution struct {
@@ -59,11 +80,80 @@ type WebDriverClient interface {
 	Quit(ctx context.Context, webDriverEndpoint string, sessionID string) error
 }
 
+type Store interface {
+	Save(record Record) error
+	List() ([]Record, error)
+	Find(sessionID string) (Record, bool, error)
+	Delete(sessionID string) error
+}
+
+type MemoryStore struct {
+	mu       sync.Mutex
+	sessions map[string]Record
+}
+
+func NewMemoryStore() *MemoryStore {
+	return &MemoryStore{sessions: map[string]Record{}}
+}
+
+func (store *MemoryStore) Save(record Record) error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.sessions == nil {
+		store.sessions = map[string]Record{}
+	}
+	store.sessions[record.SessionID] = record
+	return nil
+}
+
+func (store *MemoryStore) List() ([]Record, error) {
+	if store == nil {
+		return nil, nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	records := make([]Record, 0, len(store.sessions))
+	for _, record := range store.sessions {
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool {
+		if records[i].StartedAt != records[j].StartedAt {
+			return records[i].StartedAt < records[j].StartedAt
+		}
+		return records[i].SessionID < records[j].SessionID
+	})
+	return records, nil
+}
+
+func (store *MemoryStore) Find(sessionID string) (Record, bool, error) {
+	if store == nil {
+		return Record{}, false, nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	record, ok := store.sessions[sessionID]
+	return record, ok, nil
+}
+
+func (store *MemoryStore) Delete(sessionID string) error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	delete(store.sessions, sessionID)
+	return nil
+}
+
 type Manager struct {
-	Store     registry.FileStore
-	Grid      grid.Manager
-	WebDriver WebDriverClient
-	Now       func() time.Time
+	Store          registry.FileStore
+	Grid           grid.Manager
+	WebDriver      WebDriverClient
+	ActiveSessions Store
+	Now            func() time.Time
 }
 
 type Problem struct {
@@ -94,7 +184,7 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 	if err != nil {
 		return CreateResponse{}, err
 	}
-	record, ok := findInstalledBrowser(records, request.BrowserName, request.BrowserVersion)
+	installedRecord, ok := findInstalledBrowser(records, request.BrowserName, request.BrowserVersion)
 	if !ok {
 		return CreateResponse{}, Problem{
 			Code:    "browser_not_installed",
@@ -113,7 +203,7 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 	}
 	newSession, err := client.NewSession(ctx, NewSessionRequest{
 		WebDriverEndpoint: gridStatus.WebDriverEndpoint,
-		Capabilities:      BuildCapabilities(record),
+		Capabilities:      BuildCapabilities(installedRecord),
 	})
 	if err != nil {
 		return CreateResponse{}, Problem{Code: "webdriver_session_failed", Message: err.Error()}
@@ -130,10 +220,10 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 	title, _ := client.Title(ctx, gridStatus.WebDriverEndpoint, newSession.SessionID)
 	startedAt := manager.now().UTC().Format(time.RFC3339)
 
-	return CreateResponse{
+	record := Record{
 		SessionID:         newSession.SessionID,
-		BrowserName:       record.Family,
-		BrowserVersion:    record.Version,
+		BrowserName:       installedRecord.Family,
+		BrowserVersion:    installedRecord.Version,
 		RequestedURL:      request.URL,
 		CurrentURL:        currentURL,
 		Title:             title,
@@ -141,7 +231,88 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 		WebDriverEndpoint: gridStatus.WebDriverEndpoint,
 		NoVNC:             ResolveNoVNC(gridStatus.GridURL, newSession.SessionID, newSession.Capabilities),
 		StartedAt:         startedAt,
-	}, nil
+		Status:            StatusActive,
+	}
+	if manager.ActiveSessions != nil {
+		if err := manager.ActiveSessions.Save(record); err != nil {
+			return CreateResponse{}, err
+		}
+	}
+	return record, nil
+}
+
+func (manager Manager) ListSessions(ctx context.Context) (ListResponse, error) {
+	if manager.ActiveSessions == nil {
+		return ListResponse{}, nil
+	}
+	records, err := manager.ActiveSessions.List()
+	if err != nil {
+		return ListResponse{}, err
+	}
+	refreshed := make([]Record, 0, len(records))
+	for _, record := range records {
+		if record.Status == StatusClosed {
+			continue
+		}
+		record = manager.refreshSession(ctx, record)
+		if err := manager.ActiveSessions.Save(record); err != nil {
+			return ListResponse{}, err
+		}
+		refreshed = append(refreshed, record)
+	}
+	return ListResponse{Sessions: refreshed}, nil
+}
+
+func (manager Manager) InspectSession(ctx context.Context, sessionID string) (Record, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return Record{}, Problem{Code: "invalid_session_request", Message: "session ID is required"}
+	}
+	if manager.ActiveSessions == nil {
+		return Record{}, Problem{Code: "session_not_found", Message: "session not found: " + sessionID}
+	}
+	record, ok, err := manager.ActiveSessions.Find(sessionID)
+	if err != nil {
+		return Record{}, err
+	}
+	if !ok {
+		return Record{}, Problem{Code: "session_not_found", Message: "session not found: " + sessionID}
+	}
+	record = manager.refreshSession(ctx, record)
+	if err := manager.ActiveSessions.Save(record); err != nil {
+		return Record{}, err
+	}
+	return record, nil
+}
+
+func (manager Manager) CloseSession(ctx context.Context, sessionID string) (CloseResponse, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return CloseResponse{}, Problem{Code: "invalid_session_request", Message: "session ID is required"}
+	}
+	if manager.ActiveSessions == nil {
+		return CloseResponse{}, Problem{Code: "session_not_found", Message: "session not found: " + sessionID}
+	}
+	record, ok, err := manager.ActiveSessions.Find(sessionID)
+	if err != nil {
+		return CloseResponse{}, err
+	}
+	if !ok {
+		return CloseResponse{}, Problem{Code: "session_not_found", Message: "session not found: " + sessionID}
+	}
+	client := manager.webDriverClient()
+	if record.Status != StatusStale {
+		if err := client.Quit(ctx, record.WebDriverEndpoint, record.SessionID); err != nil {
+			record.Status = StatusStale
+			_ = manager.ActiveSessions.Save(record)
+			return CloseResponse{}, Problem{Code: "session_stale", Message: err.Error()}
+		}
+	}
+	record.Status = StatusClosed
+	if err := manager.ActiveSessions.Delete(sessionID); err != nil {
+		return CloseResponse{}, err
+	}
+	return CloseResponse{Session: record}, nil
 }
 
 func BuildCapabilities(record registry.BrowserRecord) map[string]any {
@@ -310,6 +481,27 @@ func (manager Manager) ensureGridRunning(ctx context.Context, records []registry
 		return status, nil
 	}
 	return manager.Grid.Start(ctx, records)
+}
+
+func (manager Manager) refreshSession(ctx context.Context, record Record) Record {
+	client := manager.webDriverClient()
+	currentURL, urlErr := client.CurrentURL(ctx, record.WebDriverEndpoint, record.SessionID)
+	title, titleErr := client.Title(ctx, record.WebDriverEndpoint, record.SessionID)
+	if urlErr != nil || titleErr != nil {
+		record.Status = StatusStale
+		return record
+	}
+	record.Status = StatusActive
+	record.CurrentURL = currentURL
+	record.Title = title
+	return record
+}
+
+func (manager Manager) webDriverClient() WebDriverClient {
+	if manager.WebDriver != nil {
+		return manager.WebDriver
+	}
+	return HTTPWebDriverClient{Client: http.DefaultClient}
 }
 
 func (manager Manager) now() time.Time {
