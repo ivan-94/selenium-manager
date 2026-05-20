@@ -20,10 +20,38 @@ public protocol DaemonLifecycleControlling {
 }
 
 public final class BrowserLabCLIDaemonLifecycleClient: DaemonLifecycleControlling {
-    private let executableURL: URL
-    private let baseArguments: [String]
+    let executableURL: URL
+    let baseArguments: [String]
 
     public convenience init() {
+        self.init(
+            environment: ProcessInfo.processInfo.environment,
+            bundleExecutableURL: Bundle.main.executableURL,
+            fileExists: FileManager.default.fileExists(atPath:)
+        )
+    }
+
+    convenience init(
+        environment: [String: String],
+        bundleExecutableURL: URL?,
+        fileExists: (String) -> Bool
+    ) {
+        if let explicitPath = environment["BROWSERLAB_CLI_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicitPath.isEmpty {
+            self.init(executableURL: URL(fileURLWithPath: explicitPath))
+            return
+        }
+
+        if let bundleExecutableURL {
+            let bundledCLI = bundleExecutableURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("browserlab")
+            if fileExists(bundledCLI.path) {
+                self.init(executableURL: bundledCLI)
+                return
+            }
+        }
+
         self.init(executableURL: URL(fileURLWithPath: "/usr/bin/env"), baseArguments: ["browserlab"])
     }
 

@@ -2,6 +2,39 @@ import XCTest
 @testable import BrowserLabApp
 
 final class DaemonLifecycleViewModelTests: XCTestCase {
+    func testLifecycleClientUsesExplicitCLIPathFromEnvironment() {
+        let client = BrowserLabCLIDaemonLifecycleClient(
+            environment: ["BROWSERLAB_CLI_PATH": "/tmp/browserlab"],
+            bundleExecutableURL: URL(fileURLWithPath: "/Applications/BrowserLabApp.app/Contents/MacOS/BrowserLabApp"),
+            fileExists: { _ in false }
+        )
+
+        XCTAssertEqual(client.executableURL.path, "/tmp/browserlab")
+        XCTAssertEqual(client.baseArguments, [])
+    }
+
+    func testLifecycleClientUsesBundledCLIWhenAvailable() {
+        let client = BrowserLabCLIDaemonLifecycleClient(
+            environment: [:],
+            bundleExecutableURL: URL(fileURLWithPath: "/Applications/BrowserLabApp.app/Contents/MacOS/BrowserLabApp"),
+            fileExists: { $0 == "/Applications/BrowserLabApp.app/Contents/MacOS/browserlab" }
+        )
+
+        XCTAssertEqual(client.executableURL.path, "/Applications/BrowserLabApp.app/Contents/MacOS/browserlab")
+        XCTAssertEqual(client.baseArguments, [])
+    }
+
+    func testLifecycleClientFallsBackToPathLookup() {
+        let client = BrowserLabCLIDaemonLifecycleClient(
+            environment: [:],
+            bundleExecutableURL: URL(fileURLWithPath: "/Applications/BrowserLabApp.app/Contents/MacOS/BrowserLabApp"),
+            fileExists: { _ in false }
+        )
+
+        XCTAssertEqual(client.executableURL.path, "/usr/bin/env")
+        XCTAssertEqual(client.baseArguments, ["browserlab"])
+    }
+
     func testStartStopRestartAndLogsCallLifecycleClient() async {
         let client = FakeLifecycleClient()
         let viewModel = await DaemonLifecycleViewModel(client: client)
