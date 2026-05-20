@@ -4,8 +4,11 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/ivan-94/selenium-manager/internal/browserlab/emulation"
 )
 
 func TestStoreWritesSessionScreenshotArtifactsWithStablePathsAndMetadata(t *testing.T) {
@@ -76,6 +79,53 @@ func TestStoreWritesSessionScreenshotArtifactsWithStablePathsAndMetadata(t *test
 	}
 	if metadata.ScreenshotPath != result.ScreenshotPath {
 		t.Fatalf("metadata ScreenshotPath = %q, want %q", metadata.ScreenshotPath, result.ScreenshotPath)
+	}
+}
+
+func TestStoreWritesMobileEmulationMetadata(t *testing.T) {
+	root := t.TempDir()
+	store := Store{Root: root}
+	now := time.Date(2026, 5, 20, 10, 30, 0, 0, time.UTC)
+
+	result, err := store.WriteScreenshot(ScreenshotInput{
+		GroupType:      "run",
+		GroupID:        "run-mobile",
+		BrowserName:    "chrome",
+		BrowserVersion: "119.0",
+		CapturedAt:     now,
+		MobileEmulation: emulation.Selection{
+			PresetID: "iphone-14",
+			Name:     "iPhone 14",
+			DeviceMetrics: emulation.DeviceMetrics{
+				Width:      390,
+				Height:     844,
+				PixelRatio: 3,
+			},
+			UserAgent: "mobile safari",
+		},
+		PNG: []byte("png bytes"),
+	})
+	if err != nil {
+		t.Fatalf("WriteScreenshot() error = %v", err)
+	}
+
+	var metadata ScreenshotMetadata
+	data, err := os.ReadFile(result.MetadataPath)
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatalf("decode metadata: %v\n%s", err, string(data))
+	}
+	if metadata.MobileEmulation.PresetID != "iphone-14" || metadata.MobileEmulation.DeviceMetrics.Width != 390 || metadata.MobileEmulation.UserAgent != "mobile safari" {
+		t.Fatalf("MobileEmulation = %+v, want effective preset metadata", metadata.MobileEmulation)
+	}
+	summary, err := os.ReadFile(result.SummaryPath)
+	if err != nil {
+		t.Fatalf("read summary: %v", err)
+	}
+	if !strings.Contains(string(summary), "Mobile preset: iphone-14") {
+		t.Fatalf("summary = %q, want mobile preset", string(summary))
 	}
 }
 

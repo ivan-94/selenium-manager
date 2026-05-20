@@ -8,6 +8,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/ivan-94/selenium-manager/internal/browserlab/emulation"
 )
 
 type Store struct {
@@ -15,35 +17,37 @@ type Store struct {
 }
 
 type ScreenshotInput struct {
-	GroupType      string
-	GroupID        string
-	SessionID      string
-	RunID          string
-	BrowserName    string
-	BrowserVersion string
-	RequestedURL   string
-	CurrentURL     string
-	Title          string
-	CapturedAt     time.Time
-	PNG            []byte
+	GroupType       string
+	GroupID         string
+	SessionID       string
+	RunID           string
+	BrowserName     string
+	BrowserVersion  string
+	RequestedURL    string
+	CurrentURL      string
+	Title           string
+	MobileEmulation emulation.Selection
+	CapturedAt      time.Time
+	PNG             []byte
 }
 
 type ScreenshotResult struct {
-	GroupType      string `json:"groupType"`
-	GroupID        string `json:"groupId"`
-	SessionID      string `json:"sessionId,omitempty"`
-	RunID          string `json:"runId,omitempty"`
-	BrowserName    string `json:"browserName"`
-	BrowserVersion string `json:"browserVersion"`
-	RequestedURL   string `json:"requestedUrl,omitempty"`
-	CurrentURL     string `json:"currentUrl,omitempty"`
-	Title          string `json:"title,omitempty"`
-	CapturedAt     string `json:"capturedAt"`
-	GroupDir       string `json:"groupDir"`
-	ScreenshotPath string `json:"screenshotPath"`
-	MetadataPath   string `json:"metadataPath"`
-	ResultPath     string `json:"resultPath"`
-	SummaryPath    string `json:"summaryPath"`
+	GroupType       string              `json:"groupType"`
+	GroupID         string              `json:"groupId"`
+	SessionID       string              `json:"sessionId,omitempty"`
+	RunID           string              `json:"runId,omitempty"`
+	BrowserName     string              `json:"browserName"`
+	BrowserVersion  string              `json:"browserVersion"`
+	RequestedURL    string              `json:"requestedUrl,omitempty"`
+	CurrentURL      string              `json:"currentUrl,omitempty"`
+	Title           string              `json:"title,omitempty"`
+	MobileEmulation emulation.Selection `json:"mobileEmulation,omitempty"`
+	CapturedAt      string              `json:"capturedAt"`
+	GroupDir        string              `json:"groupDir"`
+	ScreenshotPath  string              `json:"screenshotPath"`
+	MetadataPath    string              `json:"metadataPath"`
+	ResultPath      string              `json:"resultPath"`
+	SummaryPath     string              `json:"summaryPath"`
 }
 
 type ScreenshotMetadata = ScreenshotResult
@@ -77,21 +81,22 @@ func (store Store) WriteScreenshot(input ScreenshotInput) (ScreenshotResult, err
 	}
 
 	result := ScreenshotResult{
-		GroupType:      groupType,
-		GroupID:        groupID,
-		SessionID:      strings.TrimSpace(input.SessionID),
-		RunID:          strings.TrimSpace(input.RunID),
-		BrowserName:    strings.ToLower(strings.TrimSpace(input.BrowserName)),
-		BrowserVersion: strings.TrimSpace(input.BrowserVersion),
-		RequestedURL:   strings.TrimSpace(input.RequestedURL),
-		CurrentURL:     strings.TrimSpace(input.CurrentURL),
-		Title:          strings.TrimSpace(input.Title),
-		CapturedAt:     capturedAt.Format(time.RFC3339),
-		GroupDir:       groupDir,
-		ScreenshotPath: filepath.Join(groupDir, prefix+"-screenshot.png"),
-		MetadataPath:   filepath.Join(groupDir, prefix+"-metadata.json"),
-		ResultPath:     filepath.Join(groupDir, prefix+"-result.json"),
-		SummaryPath:    filepath.Join(groupDir, prefix+"-summary.md"),
+		GroupType:       groupType,
+		GroupID:         groupID,
+		SessionID:       strings.TrimSpace(input.SessionID),
+		RunID:           strings.TrimSpace(input.RunID),
+		BrowserName:     strings.ToLower(strings.TrimSpace(input.BrowserName)),
+		BrowserVersion:  strings.TrimSpace(input.BrowserVersion),
+		RequestedURL:    strings.TrimSpace(input.RequestedURL),
+		CurrentURL:      strings.TrimSpace(input.CurrentURL),
+		Title:           strings.TrimSpace(input.Title),
+		MobileEmulation: input.MobileEmulation,
+		CapturedAt:      capturedAt.Format(time.RFC3339),
+		GroupDir:        groupDir,
+		ScreenshotPath:  filepath.Join(groupDir, prefix+"-screenshot.png"),
+		MetadataPath:    filepath.Join(groupDir, prefix+"-metadata.json"),
+		ResultPath:      filepath.Join(groupDir, prefix+"-result.json"),
+		SummaryPath:     filepath.Join(groupDir, prefix+"-summary.md"),
 	}
 
 	if err := os.WriteFile(result.ScreenshotPath, input.PNG, 0o600); err != nil {
@@ -140,6 +145,16 @@ func summaryMarkdown(result ScreenshotResult) string {
 	}
 	if result.Title != "" {
 		lines = append(lines, "- Title: "+result.Title)
+	}
+	if result.MobileEmulation.PresetID != "" {
+		lines = append(lines, "- Mobile preset: "+result.MobileEmulation.PresetID+" ("+result.MobileEmulation.Name+")")
+		if result.MobileEmulation.UserAgent != "" {
+			lines = append(lines, "- Mobile user agent: "+result.MobileEmulation.UserAgent)
+		}
+		metrics := result.MobileEmulation.DeviceMetrics
+		if metrics.Width > 0 && metrics.Height > 0 {
+			lines = append(lines, fmt.Sprintf("- Mobile device metrics: %dx%d @ %.3g", metrics.Width, metrics.Height, metrics.PixelRatio))
+		}
 	}
 	return strings.Join(lines, "\n") + "\n"
 }

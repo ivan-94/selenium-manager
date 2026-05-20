@@ -35,6 +35,62 @@ func TestBuildCapabilitiesTargetsInstalledBrowserVersion(t *testing.T) {
 	}
 }
 
+func TestBuildCapabilitiesAppliesChromeMobilePreset(t *testing.T) {
+	record := registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Enabled:  true,
+	}
+
+	capabilities, selected, err := BuildCapabilitiesWithMobilePreset(record, "iphone-14")
+	if err != nil {
+		t.Fatalf("BuildCapabilitiesWithMobilePreset() error = %v", err)
+	}
+
+	chromeOptions, ok := capabilities["goog:chromeOptions"].(map[string]any)
+	if !ok {
+		t.Fatalf("goog:chromeOptions = %#v, want map", capabilities["goog:chromeOptions"])
+	}
+	mobileEmulation, ok := chromeOptions["mobileEmulation"].(map[string]any)
+	if !ok {
+		t.Fatalf("mobileEmulation = %#v, want map", chromeOptions["mobileEmulation"])
+	}
+	deviceMetrics, ok := mobileEmulation["deviceMetrics"].(map[string]any)
+	if !ok {
+		t.Fatalf("deviceMetrics = %#v, want map", mobileEmulation["deviceMetrics"])
+	}
+	if mobileEmulation["userAgent"] == "" {
+		t.Fatalf("userAgent = %#v, want populated user agent", mobileEmulation["userAgent"])
+	}
+	if deviceMetrics["width"] != 390 || deviceMetrics["height"] != 844 || deviceMetrics["pixelRatio"] != 3.0 {
+		t.Fatalf("deviceMetrics = %#v, want iPhone 14 metrics", deviceMetrics)
+	}
+	if selected.PresetID != "iphone-14" || selected.DeviceMetrics.Width != 390 || selected.UserAgent == "" {
+		t.Fatalf("selected = %+v, want normalized iPhone 14 emulation", selected)
+	}
+}
+
+func TestBuildCapabilitiesRejectsUnknownMobilePreset(t *testing.T) {
+	_, _, err := BuildCapabilitiesWithMobilePreset(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		Platform: "linux/amd64",
+		Enabled:  true,
+	}, "unknown-device")
+	if err == nil {
+		t.Fatal("BuildCapabilitiesWithMobilePreset() error = nil, want unknown preset failure")
+	}
+	var problem Problem
+	if !errors.As(err, &problem) {
+		t.Fatalf("error = %T %v, want Problem", err, err)
+	}
+	if problem.Code != "invalid_mobile_preset" {
+		t.Fatalf("problem.Code = %q, want invalid_mobile_preset", problem.Code)
+	}
+}
+
 func TestManagerCreateHeldSessionDefaultsURLAndDoesNotQuit(t *testing.T) {
 	store := registry.NewFileStore(t.TempDir())
 	_, err := store.Save(registry.BrowserRecord{
@@ -101,6 +157,48 @@ func TestManagerCreateHeldSessionDefaultsURLAndDoesNotQuit(t *testing.T) {
 	}
 }
 
+func TestManagerCreateHeldSessionRecordsMobilePreset(t *testing.T) {
+	store := registry.NewFileStore(t.TempDir())
+	_, err := store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &recordingWebDriver{
+		sessionID:  "session-123",
+		currentURL: "about:blank",
+	}
+	manager := Manager{
+		Store:     store,
+		Grid:      grid.Manager{Root: t.TempDir(), Runner: &runningGridRunner{}},
+		WebDriver: webdriver,
+		Now:       func() time.Time { return time.Date(2026, 5, 20, 10, 30, 0, 0, time.UTC) },
+	}
+
+	result, err := manager.CreateHeldSession(context.Background(), CreateRequest{
+		BrowserName:    "chrome",
+		BrowserVersion: "119.0",
+		MobilePresetID: "iphone-14",
+	})
+	if err != nil {
+		t.Fatalf("CreateHeldSession() error = %v", err)
+	}
+
+	if result.MobileEmulation.PresetID != "iphone-14" {
+		t.Fatalf("result.MobileEmulation = %+v, want iphone-14", result.MobileEmulation)
+	}
+	chromeOptions, ok := webdriver.requestedCapabilities["goog:chromeOptions"].(map[string]any)
+	if !ok || chromeOptions["mobileEmulation"] == nil {
+		t.Fatalf("requested capabilities = %#v, want Chrome mobile emulation", webdriver.requestedCapabilities)
+	}
+}
+
 func TestManagerCaptureSessionScreenshotWritesArtifact(t *testing.T) {
 	artifactsDir := t.TempDir()
 	webdriver := &recordingWebDriver{
@@ -136,6 +234,39 @@ func TestManagerCaptureSessionScreenshotWritesArtifact(t *testing.T) {
 	}
 	if result.ScreenshotPath != artifactsDir+"/sessions/session-123/20260520T103000Z-screenshot.png" {
 		t.Fatalf("ScreenshotPath = %q", result.ScreenshotPath)
+	}
+}
+
+func TestManagerCaptureSessionScreenshotWritesMobilePresetMetadata(t *testing.T) {
+	artifactsDir := t.TempDir()
+	webdriver := &recordingWebDriver{
+		screenshot: []byte("png bytes"),
+		currentURL: "https://example.test/current",
+		title:      "Example",
+	}
+	manager := Manager{
+		WebDriver:     webdriver,
+		ArtifactStore: artifact.Store{Root: artifactsDir},
+		Now:           func() time.Time { return time.Date(2026, 5, 20, 10, 30, 0, 0, time.UTC) },
+	}
+
+	result, err := manager.CaptureSessionScreenshot(context.Background(), CaptureSessionRequest{
+		SessionID:         "session-123",
+		BrowserName:       "chrome",
+		BrowserVersion:    "119.0",
+		RequestedURL:      "https://example.test/",
+		WebDriverEndpoint: "http://127.0.0.1:4444/wd/hub",
+		MobilePresetID:    "pixel-7",
+	})
+	if err != nil {
+		t.Fatalf("CaptureSessionScreenshot() error = %v", err)
+	}
+
+	if result.MobileEmulation.PresetID != "pixel-7" {
+		t.Fatalf("MobileEmulation = %+v, want pixel-7 metadata", result.MobileEmulation)
+	}
+	if result.MobileEmulation.DeviceMetrics.Width != 412 || result.MobileEmulation.UserAgent == "" {
+		t.Fatalf("MobileEmulation = %+v, want effective metrics and user agent", result.MobileEmulation)
 	}
 }
 
@@ -208,6 +339,51 @@ func TestManagerCaptureScreenshotRunCreatesShortLivedSessionAndQuits(t *testing.
 	}
 	if result.GroupType != "run" || result.SessionID != "run-session-123" || result.RunID == "" {
 		t.Fatalf("artifact = %+v, want run artifact with transient session ID", result)
+	}
+}
+
+func TestManagerCaptureScreenshotRunAppliesMobilePreset(t *testing.T) {
+	store := registry.NewFileStore(t.TempDir())
+	_, err := store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &recordingWebDriver{
+		sessionID:  "run-session-123",
+		screenshot: []byte("png"),
+		currentURL: "https://example.test/",
+	}
+	manager := Manager{
+		Store:         store,
+		Grid:          grid.Manager{Root: t.TempDir(), Runner: &runningGridRunner{}},
+		WebDriver:     webdriver,
+		ArtifactStore: artifact.Store{Root: t.TempDir()},
+		Now:           func() time.Time { return time.Date(2026, 5, 20, 10, 31, 0, 0, time.UTC) },
+	}
+
+	result, err := manager.CaptureScreenshotRun(context.Background(), CreateRequest{
+		BrowserName:    "chrome",
+		BrowserVersion: "119.0",
+		URL:            "https://example.test/",
+		MobilePresetID: "pixel-7",
+	})
+	if err != nil {
+		t.Fatalf("CaptureScreenshotRun() error = %v", err)
+	}
+
+	if result.MobileEmulation.PresetID != "pixel-7" {
+		t.Fatalf("MobileEmulation = %+v, want pixel-7", result.MobileEmulation)
+	}
+	chromeOptions, ok := webdriver.requestedCapabilities["goog:chromeOptions"].(map[string]any)
+	if !ok || chromeOptions["mobileEmulation"] == nil {
+		t.Fatalf("requested capabilities = %#v, want Chrome mobile emulation", webdriver.requestedCapabilities)
 	}
 }
 
@@ -360,22 +536,24 @@ func TestResolveNoVNCUsesGridURLForRoutedVNCWebSocket(t *testing.T) {
 }
 
 type recordingWebDriver struct {
-	sessionID           string
-	capabilities        map[string]any
-	currentURL          string
-	title               string
-	currentURLErr       error
-	titleErr            error
-	newSessionEndpoint  string
-	navigatedURL        string
-	quitCalled          bool
-	screenshot          []byte
-	screenshotErr       error
-	screenshotSessionID string
+	sessionID             string
+	capabilities          map[string]any
+	requestedCapabilities map[string]any
+	currentURL            string
+	title                 string
+	currentURLErr         error
+	titleErr              error
+	newSessionEndpoint    string
+	navigatedURL          string
+	quitCalled            bool
+	screenshot            []byte
+	screenshotErr         error
+	screenshotSessionID   string
 }
 
 func (driver *recordingWebDriver) NewSession(_ context.Context, request NewSessionRequest) (NewSessionResult, error) {
 	driver.newSessionEndpoint = request.WebDriverEndpoint
+	driver.requestedCapabilities = request.Capabilities
 	return NewSessionResult{SessionID: driver.sessionID, Capabilities: driver.capabilities}, nil
 }
 

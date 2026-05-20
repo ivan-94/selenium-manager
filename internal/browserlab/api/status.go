@@ -14,6 +14,7 @@ import (
 	"github.com/ivan-94/selenium-manager/internal/browserlab/browser"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/emulation"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
@@ -83,6 +84,10 @@ type BrowserUninstallResponse = browser.UninstallResult
 
 type BrowserListResponse struct {
 	Browsers []registry.BrowserRecord `json:"browsers"`
+}
+
+type MobilePresetCatalogResponse struct {
+	Presets []emulation.Preset `json:"presets"`
 }
 
 type GridStatusResponse struct {
@@ -240,6 +245,16 @@ func NewHandler(options ServerOptions) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, BrowserListResponse{Browsers: browsers})
+	})
+	mux.HandleFunc("GET /v1/mobile-presets", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, MobilePresetCatalogResponse{Presets: emulation.Catalog()})
 	})
 	mux.HandleFunc("POST /v1/browsers/disable", func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(r, options.AppSupport.Token) {

@@ -586,6 +586,53 @@ func TestSessionOpenJSONCreatesHeldManualSessionAndDefaultsURL(t *testing.T) {
 	}
 }
 
+func TestSessionOpenJSONAcceptsMobilePreset(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &cliWebDriver{
+		sessionID:  "session-123",
+		currentURL: "about:blank",
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:      appSupport,
+		GridRunner:      &cliGridRunner{running: true},
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"session", "open", "chrome", "119.0", "--mobile-preset", "iphone-14", "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(session open --mobile-preset --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.ManualSessionResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("session JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.MobileEmulation.PresetID != "iphone-14" {
+		t.Fatalf("MobileEmulation = %+v, want iphone-14", payload.MobileEmulation)
+	}
+	chromeOptions, ok := webdriver.requestedCapabilities["goog:chromeOptions"].(map[string]any)
+	if !ok || chromeOptions["mobileEmulation"] == nil {
+		t.Fatalf("requested capabilities = %#v, want Chrome mobile emulation", webdriver.requestedCapabilities)
+	}
+}
+
 func TestSessionOpenHumanPrintsSessionDetails(t *testing.T) {
 	t.Setenv("BROWSERLAB_HOME", t.TempDir())
 	appSupport, err := config.EnsureAppSupport()
@@ -769,6 +816,54 @@ func TestScreenshotRunJSONOutputsArtifactPaths(t *testing.T) {
 	}
 }
 
+func TestScreenshotRunJSONAcceptsMobilePreset(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &cliWebDriver{
+		sessionID:  "run-session-123",
+		currentURL: "https://example.test/",
+		screenshot: []byte("png"),
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:      appSupport,
+		GridRunner:      &cliGridRunner{running: true},
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"screenshot", "chrome", "119.0", "https://example.test/", "--mobile-preset", "pixel-7", "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(screenshot --mobile-preset --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.ScreenshotResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("screenshot JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.MobileEmulation.PresetID != "pixel-7" {
+		t.Fatalf("MobileEmulation = %+v, want pixel-7", payload.MobileEmulation)
+	}
+	chromeOptions, ok := webdriver.requestedCapabilities["goog:chromeOptions"].(map[string]any)
+	if !ok || chromeOptions["mobileEmulation"] == nil {
+		t.Fatalf("requested capabilities = %#v, want Chrome mobile emulation", webdriver.requestedCapabilities)
+	}
+}
+
 func TestSessionScreenshotHumanOutputsArtifactPaths(t *testing.T) {
 	t.Setenv("BROWSERLAB_HOME", t.TempDir())
 	appSupport, err := config.EnsureAppSupport()
@@ -828,19 +923,21 @@ type cliGridRunner struct {
 }
 
 type cliWebDriver struct {
-	sessionID          string
-	capabilities       map[string]any
-	currentURL         string
-	title              string
-	newSessionEndpoint string
-	navigatedURL       string
-	quitCalled         bool
-	screenshot         []byte
-	screenshotErr      error
+	sessionID             string
+	capabilities          map[string]any
+	requestedCapabilities map[string]any
+	currentURL            string
+	title                 string
+	newSessionEndpoint    string
+	navigatedURL          string
+	quitCalled            bool
+	screenshot            []byte
+	screenshotErr         error
 }
 
 func (driver *cliWebDriver) NewSession(_ context.Context, request browserlabsession.NewSessionRequest) (browserlabsession.NewSessionResult, error) {
 	driver.newSessionEndpoint = request.WebDriverEndpoint
+	driver.requestedCapabilities = request.Capabilities
 	return browserlabsession.NewSessionResult{SessionID: driver.sessionID, Capabilities: driver.capabilities}, nil
 }
 
