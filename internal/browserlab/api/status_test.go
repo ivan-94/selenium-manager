@@ -551,6 +551,121 @@ func TestManualSessionEndpointCreatesHeldSessionFromInstalledBrowser(t *testing.
 	}
 }
 
+func TestSessionEndpointsListInspectAndCloseHeldSessions(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &apiWebDriver{
+		sessionID:  "session-123",
+		currentURL: "https://example.test/",
+		title:      "Example",
+		capabilities: map[string]any{
+			"se:vnc": "ws://172.17.0.2:4444/session/session-123/se/vnc",
+		},
+	}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:      appSupport,
+		GridRunner:      &apiGridRunner{running: true},
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	body := bytes.NewBufferString(`{"browserName":"chrome","browserVersion":"119.0","url":"https://example.test/"}`)
+	openReq, err := http.NewRequest(http.MethodPost, server.URL+"/v1/sessions/manual", body)
+	if err != nil {
+		t.Fatalf("NewRequest(open) error = %v", err)
+	}
+	openReq.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	openResp, err := http.DefaultClient.Do(openReq)
+	if err != nil {
+		t.Fatalf("POST /v1/sessions/manual error = %v", err)
+	}
+	openResp.Body.Close()
+	if openResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/sessions/manual status = %d, want 200", openResp.StatusCode)
+	}
+
+	listReq, err := http.NewRequest(http.MethodGet, server.URL+"/v1/sessions", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(list) error = %v", err)
+	}
+	listReq.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	listResp, err := http.DefaultClient.Do(listReq)
+	if err != nil {
+		t.Fatalf("GET /v1/sessions error = %v", err)
+	}
+	defer listResp.Body.Close()
+	if listResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/sessions status = %d, want 200", listResp.StatusCode)
+	}
+	var list SessionListResponse
+	if err := json.NewDecoder(listResp.Body).Decode(&list); err != nil {
+		t.Fatalf("decode session list: %v", err)
+	}
+	if len(list.Sessions) != 1 || list.Sessions[0].SessionID != "session-123" {
+		t.Fatalf("session list = %+v, want created session", list.Sessions)
+	}
+	if list.Sessions[0].Status != browserlabsession.StatusActive || list.Sessions[0].Title != "Example" {
+		t.Fatalf("session state = %+v, want active title", list.Sessions[0])
+	}
+
+	inspectReq, err := http.NewRequest(http.MethodGet, server.URL+"/v1/sessions/session-123", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(inspect) error = %v", err)
+	}
+	inspectReq.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	inspectResp, err := http.DefaultClient.Do(inspectReq)
+	if err != nil {
+		t.Fatalf("GET /v1/sessions/{id} error = %v", err)
+	}
+	defer inspectResp.Body.Close()
+	if inspectResp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/sessions/{id} status = %d, want 200", inspectResp.StatusCode)
+	}
+	var inspected SessionInspectResponse
+	if err := json.NewDecoder(inspectResp.Body).Decode(&inspected); err != nil {
+		t.Fatalf("decode session inspect: %v", err)
+	}
+	if inspected.Session.NoVNC.URL != "http://127.0.0.1:4444/ui/#/sessions/session-123" {
+		t.Fatalf("inspect noVNC URL = %q", inspected.Session.NoVNC.URL)
+	}
+
+	closeReq, err := http.NewRequest(http.MethodDelete, server.URL+"/v1/sessions/session-123", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(close) error = %v", err)
+	}
+	closeReq.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	closeResp, err := http.DefaultClient.Do(closeReq)
+	if err != nil {
+		t.Fatalf("DELETE /v1/sessions/{id} error = %v", err)
+	}
+	defer closeResp.Body.Close()
+	if closeResp.StatusCode != http.StatusOK {
+		t.Fatalf("DELETE /v1/sessions/{id} status = %d, want 200", closeResp.StatusCode)
+	}
+	var closed SessionCloseResponse
+	if err := json.NewDecoder(closeResp.Body).Decode(&closed); err != nil {
+		t.Fatalf("decode session close: %v", err)
+	}
+	if closed.Session.Status != browserlabsession.StatusClosed || !webdriver.quitCalled {
+		t.Fatalf("closed = %+v quitCalled=%v, want closed and quit", closed.Session, webdriver.quitCalled)
+	}
+}
+
 func TestDefaultListenAddrIsLocalhostOnly(t *testing.T) {
 	if !IsLocalListenAddr(DefaultListenAddr) {
 		t.Fatalf("DefaultListenAddr %q must be localhost-only", DefaultListenAddr)

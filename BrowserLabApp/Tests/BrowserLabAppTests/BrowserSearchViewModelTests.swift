@@ -148,6 +148,67 @@ final class BrowserSearchViewModelTests: XCTestCase {
         XCTAssertEqual(activeSession?.requestedUrl, "about:blank")
         XCTAssertEqual(activeNoVNCURL?.absoluteString, "http://127.0.0.1:4444/ui/#/sessions/session-123")
     }
+
+    func testRefreshActiveSessionsAndCloseAction() async {
+        let active = ManualSessionResponse(
+            sessionId: "session-123",
+            browserName: "chrome",
+            browserVersion: "119.0",
+            requestedUrl: "https://example.test/",
+            currentUrl: "https://example.test/",
+            title: "Example",
+            gridUrl: "http://127.0.0.1:4444",
+            webdriverEndpoint: "http://127.0.0.1:4444/wd/hub",
+            noVnc: .init(
+                url: "http://127.0.0.1:4444/ui/#/sessions/session-123",
+                vncWebSocketUrl: "ws://127.0.0.1:4444/session/session-123/se/vnc",
+                vncLocalAddress: nil,
+                gridSessionUrl: "http://127.0.0.1:4444/ui/#/sessions/session-123"
+            ),
+            startedAt: "2026-05-20T10:30:00Z",
+            status: "active"
+        )
+        let closed = ManualSessionResponse(
+            sessionId: "session-123",
+            browserName: "chrome",
+            browserVersion: "119.0",
+            requestedUrl: "https://example.test/",
+            currentUrl: "https://example.test/",
+            title: "Example",
+            gridUrl: "http://127.0.0.1:4444",
+            webdriverEndpoint: "http://127.0.0.1:4444/wd/hub",
+            noVnc: active.noVnc,
+            startedAt: "2026-05-20T10:30:00Z",
+            status: "closed"
+        )
+        let sessions = FakeSessionManager(
+            listResponses: [
+                .success(.init(sessions: [active])),
+                .success(.init(sessions: []))
+            ],
+            closeResponse: .success(.init(session: closed))
+        )
+        let viewModel = await BrowserSearchViewModel(
+            client: FakeBrowserSearchClient(response: .success(.init(browser: "chrome", query: "", results: []))),
+            sessionLister: sessions,
+            sessionCloser: sessions
+        )
+
+        await viewModel.refreshActiveSessions()
+
+        let rows = await viewModel.activeSessionRows
+        XCTAssertEqual(rows.count, 1)
+        XCTAssertEqual(rows[0].title, "Session session-123")
+        XCTAssertTrue(rows[0].detail.contains("Status: active"))
+        XCTAssertTrue(rows[0].detail.contains("Title: Example"))
+        XCTAssertEqual(rows[0].noVNCURL?.absoluteString, "http://127.0.0.1:4444/ui/#/sessions/session-123")
+
+        await viewModel.closeSession(sessionId: "session-123")
+
+        let refreshedRows = await viewModel.activeSessionRows
+        XCTAssertEqual(sessions.closedSessionID, "session-123")
+        XCTAssertEqual(refreshedRows, [])
+    }
 }
 
 private struct FakeBrowserSearchClient: BrowserVersionSearching {
@@ -189,5 +250,31 @@ private final class FakeManualSessionOpener: ManualSessionOpening {
         requestedBrowser = browser
         requestedURL = url
         return try response.get()
+    }
+}
+
+private final class FakeSessionManager: ActiveSessionListing, SessionClosing {
+    private var listResponses: [Result<SessionListResponse, Error>]
+    let closeResponse: Result<SessionCloseResponse, Error>
+    private(set) var closedSessionID: String?
+
+    init(
+        listResponses: [Result<SessionListResponse, Error>],
+        closeResponse: Result<SessionCloseResponse, Error>
+    ) {
+        self.listResponses = listResponses
+        self.closeResponse = closeResponse
+    }
+
+    func listActiveSessions() async throws -> SessionListResponse {
+        if listResponses.isEmpty {
+            return .init(sessions: [])
+        }
+        return try listResponses.removeFirst().get()
+    }
+
+    func closeSession(sessionId: String) async throws -> SessionCloseResponse {
+        closedSessionID = sessionId
+        return try closeResponse.get()
     }
 }

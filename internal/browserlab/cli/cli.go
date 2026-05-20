@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -53,6 +54,8 @@ func RunWithOptions(args []string, stdout io.Writer, stderr io.Writer, options O
 		return runGrid(args[1:], stdout, stderr)
 	case "session":
 		return runSession(args[1:], stdout, stderr)
+	case "sessions":
+		return runSessions(args[1:], stdout, stderr)
 	case "-h", "--help", "help":
 		writeUsage(stdout)
 		return 0
@@ -69,6 +72,7 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "       browserlab browsers [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab grid <start|stop|status|config> [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab session open chrome VERSION [URL] [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab sessions <list|inspect|close> [SESSION_ID] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
 }
 
@@ -250,8 +254,9 @@ func runSessionOpen(args []string, stdout io.Writer, stderr io.Writer) int {
 		URL:            parsed.url,
 	})
 	if err != nil {
-		writeProblem(stdout, parsed.jsonOutput, "session_failed", err.Error())
-		return 2
+		code, message := problemDetails(err, "session_failed")
+		writeProblem(stdout, parsed.jsonOutput, code, message)
+		return sessionExitCode(err)
 	}
 	if parsed.jsonOutput {
 		_ = json.NewEncoder(stdout).Encode(result)
@@ -259,6 +264,85 @@ func runSessionOpen(args []string, stdout io.Writer, stderr io.Writer) int {
 	}
 	writeManualSessionHuman(stdout, result)
 	return 0
+}
+
+func runSessions(args []string, stdout io.Writer, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "usage: browserlab sessions <list|inspect|close> [SESSION_ID] [--json] [--base-url URL]")
+		return 64
+	}
+	command := args[0]
+	parsed, err := parseSessionsArgs(args[1:])
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 64
+	}
+
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	switch command {
+	case "list":
+		if len(parsed.positionals) != 0 {
+			fmt.Fprintf(stderr, "unexpected argument: %s\n", parsed.positionals[0])
+			return 64
+		}
+		list, err := fetchSessions(ctx, parsed.baseURL, appSupport.Token)
+		if err != nil {
+			code, message := problemDetails(err, "session_failed")
+			writeProblem(stdout, parsed.jsonOutput, code, message)
+			return sessionExitCode(err)
+		}
+		if parsed.jsonOutput {
+			_ = json.NewEncoder(stdout).Encode(list)
+			return 0
+		}
+		writeSessionsHuman(stdout, list)
+		return 0
+	case "inspect":
+		if len(parsed.positionals) != 1 {
+			fmt.Fprintln(stderr, "usage: browserlab sessions inspect SESSION_ID [--json] [--base-url URL]")
+			return 64
+		}
+		inspected, err := inspectSession(ctx, parsed.baseURL, appSupport.Token, parsed.positionals[0])
+		if err != nil {
+			code, message := problemDetails(err, "session_failed")
+			writeProblem(stdout, parsed.jsonOutput, code, message)
+			return sessionExitCode(err)
+		}
+		if parsed.jsonOutput {
+			_ = json.NewEncoder(stdout).Encode(inspected)
+			return 0
+		}
+		writeSessionRecordHuman(stdout, inspected.Session)
+		return 0
+	case "close":
+		if len(parsed.positionals) != 1 {
+			fmt.Fprintln(stderr, "usage: browserlab sessions close SESSION_ID [--json] [--base-url URL]")
+			return 64
+		}
+		closed, err := closeSession(ctx, parsed.baseURL, appSupport.Token, parsed.positionals[0])
+		if err != nil {
+			code, message := problemDetails(err, "session_failed")
+			writeProblem(stdout, parsed.jsonOutput, code, message)
+			return sessionExitCode(err)
+		}
+		if parsed.jsonOutput {
+			_ = json.NewEncoder(stdout).Encode(closed)
+			return 0
+		}
+		fmt.Fprintf(stdout, "Closed session: %s\n", closed.Session.SessionID)
+		return 0
+	default:
+		fmt.Fprintf(stderr, "unknown sessions command: %s\n", command)
+		return 64
+	}
 }
 
 func runSearch(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -636,12 +720,107 @@ func createManualSession(ctx context.Context, baseURL string, token string, requ
 	return result, nil
 }
 
+func fetchSessions(ctx context.Context, baseURL string, token string) (api.SessionListResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/sessions", nil)
+	if err != nil {
+		return api.SessionListResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.SessionListResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.SessionListResponse{}, decodeProblem(resp)
+	}
+
+	var result api.SessionListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.SessionListResponse{}, err
+	}
+	return result, nil
+}
+
+func inspectSession(ctx context.Context, baseURL string, token string, sessionID string) (api.SessionInspectResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/sessions/"+url.PathEscape(sessionID), nil)
+	if err != nil {
+		return api.SessionInspectResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.SessionInspectResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.SessionInspectResponse{}, decodeProblem(resp)
+	}
+
+	var result api.SessionInspectResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.SessionInspectResponse{}, err
+	}
+	return result, nil
+}
+
+func closeSession(ctx context.Context, baseURL string, token string, sessionID string) (api.SessionCloseResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, baseURL+"/v1/sessions/"+url.PathEscape(sessionID), nil)
+	if err != nil {
+		return api.SessionCloseResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.SessionCloseResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.SessionCloseResponse{}, decodeProblem(resp)
+	}
+
+	var result api.SessionCloseResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.SessionCloseResponse{}, err
+	}
+	return result, nil
+}
+
 func decodeProblem(resp *http.Response) error {
 	var problem api.StatusProblem
 	if err := json.NewDecoder(resp.Body).Decode(&problem); err == nil && problem.Message != "" {
-		return fmt.Errorf("%s: %s", problem.Code, problem.Message)
+		return daemonProblem{StatusCode: resp.StatusCode, Code: problem.Code, Message: problem.Message}
 	}
 	return fmt.Errorf("daemon returned HTTP %d", resp.StatusCode)
+}
+
+type daemonProblem struct {
+	StatusCode int
+	Code       string
+	Message    string
+}
+
+func (problem daemonProblem) Error() string {
+	return problem.Code + ": " + problem.Message
+}
+
+func problemDetails(err error, fallbackCode string) (string, string) {
+	var problem daemonProblem
+	if errors.As(err, &problem) {
+		return problem.Code, problem.Message
+	}
+	return fallbackCode, err.Error()
+}
+
+func sessionExitCode(err error) int {
+	var problem daemonProblem
+	if errors.As(err, &problem) && problem.Code == "session_not_found" {
+		return 3
+	}
+	return 2
 }
 
 func writeStopped(stdout io.Writer, asJSON bool, code string, message string) {
@@ -681,6 +860,34 @@ type sessionOpenArgs struct {
 	url        string
 	jsonOutput bool
 	baseURL    string
+}
+
+type sessionsArgs struct {
+	jsonOutput  bool
+	baseURL     string
+	positionals []string
+}
+
+func parseSessionsArgs(args []string) (sessionsArgs, error) {
+	parsed := sessionsArgs{baseURL: defaultBaseURL}
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--json":
+			parsed.jsonOutput = true
+		case "--base-url":
+			if i+1 >= len(args) {
+				return sessionsArgs{}, fmt.Errorf("--base-url requires a URL")
+			}
+			parsed.baseURL = args[i+1]
+			i++
+		default:
+			if strings.HasPrefix(args[i], "-") {
+				return sessionsArgs{}, fmt.Errorf("unknown flag: %s", args[i])
+			}
+			parsed.positionals = append(parsed.positionals, args[i])
+		}
+	}
+	return parsed, nil
 }
 
 func parseSessionOpenArgs(args []string) (sessionOpenArgs, error) {
@@ -910,6 +1117,31 @@ func writeManualSessionHuman(stdout io.Writer, result api.ManualSessionResponse)
 	}
 	if result.NoVNC.VNCWebSocketURL != "" {
 		fmt.Fprintf(stdout, "VNC websocket: %s\n", result.NoVNC.VNCWebSocketURL)
+	}
+}
+
+func writeSessionsHuman(stdout io.Writer, list api.SessionListResponse) {
+	if len(list.Sessions) == 0 {
+		fmt.Fprintln(stdout, "No active sessions.")
+		return
+	}
+	for _, session := range list.Sessions {
+		writeSessionRecordHuman(stdout, session)
+	}
+}
+
+func writeSessionRecordHuman(stdout io.Writer, session api.ManualSessionResponse) {
+	fmt.Fprintf(stdout, "Session: %s (%s)\n", session.SessionID, session.Status)
+	fmt.Fprintf(stdout, "Browser: %s %s\n", displayBrowserName(session.BrowserName), session.BrowserVersion)
+	fmt.Fprintf(stdout, "Started: %s\n", session.StartedAt)
+	if session.CurrentURL != "" {
+		fmt.Fprintf(stdout, "Current URL: %s\n", session.CurrentURL)
+	}
+	if session.Title != "" {
+		fmt.Fprintf(stdout, "Title: %s\n", session.Title)
+	}
+	if session.NoVNC.URL != "" {
+		fmt.Fprintf(stdout, "noVNC: %s\n", session.NoVNC.URL)
 	}
 }
 
