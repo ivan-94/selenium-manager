@@ -237,6 +237,7 @@ func (manager Manager) CreateHeldSession(ctx context.Context, request CreateRequ
 	}
 
 	if err := client.Navigate(ctx, gridStatus.WebDriverEndpoint, newSession.SessionID, request.URL); err != nil {
+		_ = client.Quit(context.Background(), gridStatus.WebDriverEndpoint, newSession.SessionID)
 		return CreateResponse{}, Problem{Code: "navigation_failed", Message: err.Error()}
 	}
 

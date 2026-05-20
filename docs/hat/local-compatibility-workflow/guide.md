@@ -25,12 +25,12 @@ Implemented parent PRD slices reflected in this guide:
 - #7 Open held manual browser sessions with noVNC.
 - #8 List, inspect, and close active sessions.
 - #9 Capture screenshots and session artifacts.
+- #10 Chrome mobile emulation presets for manual sessions and screenshots.
 - #11 Show native Safari as detected non-installable runtime.
 - #12 Disable and uninstall installed browser versions.
 
 Not covered as product behavior in this HAT flow:
 
-- #10 Chrome mobile emulation presets. Do not mark this HAT failed for missing mobile preset controls unless #10 has been merged into the branch under test.
 - Old Safari installation, Selenoid, third-party images, Android/iOS devices, video artifacts, remote daemon access, and cloud browser providers are outside the MVP PRD scope.
 
 ## Prerequisites
@@ -74,6 +74,12 @@ Default browser search target:
 
 ```sh
 export BL_SEARCH_QUERY="${BL_SEARCH_QUERY:-90}"
+```
+
+Default Chrome mobile emulation preset:
+
+```sh
+export BL_MOBILE_PRESET="${BL_MOBILE_PRESET:-iphone-14}"
 ```
 
 Select an exact Chrome version from search output. Do not assume `90` is installable directly; BrowserLab stores exact Selenium image provenance.
@@ -302,6 +308,30 @@ Evidence:
 - `.hat/local-compatibility/evidence/cli-screenshot-run.json`
 - Artifact files listed in the response.
 
+### P1. Mobile Emulation Screenshot Run
+
+This verifies the Chrome mobile emulation path with a real Selenium screenshot run.
+
+Steps:
+
+```sh
+browserlab screenshot chrome "$BL_VERSION" "$BL_TARGET_URL" \
+  --mobile-preset "$BL_MOBILE_PRESET" \
+  --json | tee "$HAT_EVIDENCE_DIR/cli-mobile-screenshot-run.json"
+```
+
+Expected:
+
+- Response has `mobileEmulation.presetId` equal to `$BL_MOBILE_PRESET`.
+- Response records non-empty `mobileEmulation.deviceMetrics` and `mobileEmulation.userAgent`.
+- Artifact metadata JSON records the same mobile preset, metrics, and user agent.
+- Screenshot dimensions and visual layout are consistent with the selected preset.
+
+Evidence:
+
+- `.hat/local-compatibility/evidence/cli-mobile-screenshot-run.json`
+- Artifact metadata and screenshot files listed in the response.
+
 ## App Acceptance Path
 
 Run the App from the same shell so it uses the isolated `BROWSERLAB_HOME`:
@@ -357,19 +387,22 @@ Evidence:
 Steps:
 
 1. In `Installed Browsers`, enter `$BL_TARGET_URL` in the URL field.
-2. Click `Open` for the selected Chrome version.
-3. Confirm an active session appears.
-4. Confirm the embedded noVNC view loads and shows the browser session.
-5. Click `Open External` and confirm the external noVNC URL opens the same session.
-6. Click `Capture` while the session is active.
-7. Confirm `Recent Artifacts` lists screenshot, metadata, and summary paths.
-8. In `Active Sessions`, click `Close`.
-9. Confirm the session disappears from active sessions.
+2. Select `$BL_MOBILE_PRESET` in the `Mobile` picker, or keep `Desktop` for the desktop control path.
+3. Click `Open` for the selected Chrome version.
+4. Confirm an active session appears.
+5. Confirm the embedded noVNC view loads and shows the browser session.
+6. Click `Open External` and confirm the external noVNC URL opens the same session.
+7. If a mobile preset was selected, confirm the active session details show the mobile preset name.
+8. Click `Capture` while the session is active.
+9. Confirm `Recent Artifacts` lists screenshot, metadata, and summary paths.
+10. In `Active Sessions`, click `Close`.
+11. Confirm the session disappears from active sessions.
 
 Expected:
 
 - The App-created session has the same fields as CLI-created sessions: session ID, Chrome version, requested URL, current URL/title when WebDriver returns them, Grid URL, WebDriver endpoint, and noVNC URL.
 - `Capture` writes the same session artifact shape as the CLI path.
+- Mobile preset selection writes the same mobile emulation metadata as the CLI path.
 - `Close` frees the browser slot and removes the session from active sessions.
 
 Evidence:
@@ -469,6 +502,7 @@ P0 App status:
 P0 App search/install:
 P0 App session/noVNC/screenshot/close:
 P1 screenshot run:
+P1 mobile screenshot run:
 
 Evidence directory:
 Session artifact directory:
@@ -490,6 +524,7 @@ Final verdict:
 - Handoff policy and Source Manifest requirements: `/Users/ivan/.agents/docs/agents/handoff-policy.md`
 - HAT preparation skill instructions: `/Users/ivan/.agents/skills/hat-prepare/SKILL.md`
 - Runtime support conventions: `docs/runtime/app-support.md`
+- Mobile emulation implementation: `internal/browserlab/emulation/catalog.go`
 - CLI/API implementation: `internal/browserlab/cli/cli.go`, `internal/browserlab/api/status.go`
 - Browser/session/artifact implementation: `internal/browserlab/catalog/catalog.go`, `internal/browserlab/install/install.go`, `internal/browserlab/grid/grid.go`, `internal/browserlab/grid/manager.go`, `internal/browserlab/session/session.go`, `internal/browserlab/artifact/artifact.go`
 - SwiftUI App implementation: `BrowserLabApp/Sources/BrowserLabApp/BrowserLabApp.swift`, `BrowserLabApp/Sources/BrowserLabApp/BrowserSearch.swift`, `BrowserLabApp/Sources/BrowserLabApp/DaemonStatus.swift`, `BrowserLabApp/Sources/BrowserLabApp/DaemonLifecycle.swift`
@@ -504,7 +539,7 @@ Final verdict:
 - Use `blank` HAT mode with an isolated `.hat/local-compatibility/browserlab-home` via `BROWSERLAB_HOME`.
 - Build HAT binaries under `.hat/local-compatibility/bin` instead of requiring global installation.
 - Keep Docker image deletion out of default cleanup because images may be shared.
-- Document #10 mobile emulation as out of this guide's current product behavior because the requested slice forbids product-code work for #10.
+- Cover #10 mobile emulation through both CLI screenshot and App picker/manual-session paths.
 - Treat Apple Silicon `linux/amd64` Chrome images as expected emulation behavior that must be visible in evidence.
 
 ### Verification evidence

@@ -157,6 +157,46 @@ func TestManagerCreateHeldSessionDefaultsURLAndDoesNotQuit(t *testing.T) {
 	}
 }
 
+func TestManagerCreateHeldSessionQuitsWhenNavigationFails(t *testing.T) {
+	store := registry.NewFileStore(t.TempDir())
+	_, err := store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &recordingWebDriver{
+		sessionID:   "session-123",
+		navigateErr: errors.New("navigation timed out"),
+	}
+	manager := Manager{
+		Store:     store,
+		Grid:      grid.Manager{Root: t.TempDir(), Runner: &runningGridRunner{}},
+		WebDriver: webdriver,
+	}
+
+	_, err = manager.CreateHeldSession(context.Background(), CreateRequest{
+		BrowserName:    "chrome",
+		BrowserVersion: "119.0",
+		URL:            "https://example.test/",
+	})
+	if err == nil {
+		t.Fatal("CreateHeldSession() error = nil, want navigation failure")
+	}
+	var problem Problem
+	if !errors.As(err, &problem) || problem.Code != "navigation_failed" {
+		t.Fatalf("error = %T %v, want navigation_failed Problem", err, err)
+	}
+	if !webdriver.quitCalled {
+		t.Fatal("navigation failure did not quit the created WebDriver session")
+	}
+}
+
 func TestManagerCreateHeldSessionRecordsMobilePreset(t *testing.T) {
 	store := registry.NewFileStore(t.TempDir())
 	_, err := store.Save(registry.BrowserRecord{
@@ -543,6 +583,7 @@ type recordingWebDriver struct {
 	title                 string
 	currentURLErr         error
 	titleErr              error
+	navigateErr           error
 	newSessionEndpoint    string
 	navigatedURL          string
 	quitCalled            bool
@@ -559,6 +600,9 @@ func (driver *recordingWebDriver) NewSession(_ context.Context, request NewSessi
 
 func (driver *recordingWebDriver) Navigate(_ context.Context, _ string, _ string, url string) error {
 	driver.navigatedURL = url
+	if driver.navigateErr != nil {
+		return driver.navigateErr
+	}
 	return nil
 }
 

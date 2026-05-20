@@ -136,18 +136,23 @@ func NewHandler(options ServerOptions) http.Handler {
 		Root:   options.AppSupport.Paths.Root,
 		Runner: options.GridRunner,
 	}
+	activeSessions := browserlabsession.NewMemoryStore()
 	sessionManager := browserlabsession.Manager{
 		Store:          registryStore,
 		Grid:           gridManager,
 		WebDriver:      options.WebDriverClient,
-		ActiveSessions: browserlabsession.NewMemoryStore(),
+		ActiveSessions: activeSessions,
 		ArtifactStore: artifact.Store{
 			Root: options.AppSupport.Paths.ArtifactsDir,
 		},
 	}
+	sessionChecker := options.SessionChecker
+	if sessionChecker == nil {
+		sessionChecker = activeSessionChecker{store: activeSessions}
+	}
 	browserManager := browser.Manager{
 		Store:          registryStore,
-		SessionChecker: options.SessionChecker,
+		SessionChecker: sessionChecker,
 		ImageRemover:   options.ImageRemover,
 	}
 
@@ -555,6 +560,36 @@ func IsLocalListenAddr(addr string) bool {
 	}
 	host = strings.Trim(host, "[]")
 	return host == "127.0.0.1" || host == "::1" || strings.EqualFold(host, "localhost")
+}
+
+type activeSessionChecker struct {
+	store browserlabsession.Store
+}
+
+func (checker activeSessionChecker) ActiveSessionsForBrowser(_ context.Context, record registry.BrowserRecord) ([]browser.ActiveSession, error) {
+	if checker.store == nil {
+		return nil, nil
+	}
+	sessions, err := checker.store.List()
+	if err != nil {
+		return nil, err
+	}
+	active := make([]browser.ActiveSession, 0, len(sessions))
+	for _, session := range sessions {
+		if session.Status != browserlabsession.StatusActive {
+			continue
+		}
+		if !strings.EqualFold(session.BrowserName, record.Family) || strings.TrimSpace(session.BrowserVersion) != strings.TrimSpace(record.Version) {
+			continue
+		}
+		active = append(active, browser.ActiveSession{
+			ID:             session.SessionID,
+			BrowserName:    session.BrowserName,
+			BrowserVersion: session.BrowserVersion,
+			ImageTag:       record.ImageTag,
+		})
+	}
+	return active, nil
 }
 
 func authorized(r *http.Request, token string) bool {

@@ -598,6 +598,56 @@ func TestManualSessionEndpointCreatesHeldSessionFromInstalledBrowser(t *testing.
 	}
 }
 
+func TestBrowserUninstallEndpointUsesHeldSessionsFromRealHandler(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: imageTag,
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport: appSupport,
+		GridRunner: &apiGridRunner{running: true},
+		WebDriverClient: &apiWebDriver{
+			sessionID:  "session-123",
+			currentURL: "https://example.test/",
+			title:      "Example",
+		},
+	}))
+	t.Cleanup(server.Close)
+
+	sessionResp := postJSON(t, server.URL+"/v1/sessions/manual", appSupport.Token, `{"browserName":"chrome","browserVersion":"119.0","url":"https://example.test/"}`)
+	defer sessionResp.Body.Close()
+	if sessionResp.StatusCode != http.StatusOK {
+		t.Fatalf("manual session status = %d, want 200", sessionResp.StatusCode)
+	}
+
+	uninstallResp := postJSON(t, server.URL+"/v1/browsers/uninstall", appSupport.Token, `{"imageTag":"`+imageTag+`"}`)
+	defer uninstallResp.Body.Close()
+	if uninstallResp.StatusCode != http.StatusConflict {
+		t.Fatalf("uninstall active status = %d, want 409", uninstallResp.StatusCode)
+	}
+	var problem StatusProblem
+	if err := json.NewDecoder(uninstallResp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem.Code != "active_sessions_block_uninstall" {
+		t.Fatalf("problem = %+v, want active session block", problem)
+	}
+}
+
 func TestBrowserManagementEndpointsDisableUninstallAndRequireImageDeleteConfirmation(t *testing.T) {
 	t.Setenv("BROWSERLAB_HOME", t.TempDir())
 	appSupport, err := config.EnsureAppSupport()
