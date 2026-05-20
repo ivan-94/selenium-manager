@@ -3,16 +3,16 @@ import SwiftUI
 @main
 struct BrowserLabApplication: App {
     var body: some Scene {
-        WindowGroup {
-            VStack(alignment: .leading, spacing: 16) {
-                DaemonStatusView(viewModel: DaemonStatusViewModel(
+        WindowGroup("BrowserLab") {
+            let browserClient = URLSessionBrowserSearchClient()
+            BrowserLabWorkbenchView(
+                daemonStatusViewModel: DaemonStatusViewModel(
                     client: URLSessionDaemonStatusClient()
-                ))
-                DaemonLifecycleControlsView(viewModel: DaemonLifecycleViewModel(
+                ),
+                daemonLifecycleViewModel: DaemonLifecycleViewModel(
                     client: BrowserLabCLIDaemonLifecycleClient()
-                ))
-                let browserClient = URLSessionBrowserSearchClient()
-                BrowserSearchView(viewModel: BrowserSearchViewModel(
+                ),
+                browserViewModel: BrowserSearchViewModel(
                     client: browserClient,
                     installer: browserClient,
                     lister: browserClient,
@@ -23,11 +23,10 @@ struct BrowserLabApplication: App {
                     sessionLister: browserClient,
                     sessionCloser: browserClient,
                     screenshotCapturer: browserClient
-                ))
-                .padding(.horizontal, 24)
-                .padding(.bottom, 24)
-            }
-            .frame(minWidth: 640, minHeight: 460)
+                )
+            )
+            .frame(minWidth: 1120, minHeight: 740)
         }
+        .defaultSize(width: 1360, height: 860)
     }
 }
