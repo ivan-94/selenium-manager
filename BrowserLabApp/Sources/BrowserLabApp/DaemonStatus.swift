@@ -154,6 +154,22 @@ public enum DaemonStatusClientError: Error, Equatable {
     case tokenMissing(String)
     case badHTTPStatus(Int)
     case nonLocalDaemon(String)
+    case apiProblem(String, String)
+}
+
+extension DaemonStatusClientError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .tokenMissing(let path):
+            return "BrowserLab token is missing at \(path)"
+        case .badHTTPStatus(let status):
+            return "BrowserLab daemon returned HTTP \(status)"
+        case .nonLocalDaemon(let bind):
+            return "BrowserLab daemon is not localhost-only: \(bind)"
+        case .apiProblem(let code, let message):
+            return "\(code): \(message)"
+        }
+    }
 }
 
 public final class URLSessionDaemonStatusClient: DaemonStatusFetching {

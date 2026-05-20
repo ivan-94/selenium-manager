@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/ivan-94/selenium-manager/internal/browserlab/api"
+	"github.com/ivan-94/selenium-manager/internal/browserlab/browser"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
@@ -67,6 +68,8 @@ func writeUsage(w io.Writer) {
 	fmt.Fprintln(w, "       browserlab search chrome [query] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab install chrome [version] [--image-tag TAG] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab browsers [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab browsers disable --image-tag TAG [--json] [--base-url URL]")
+	fmt.Fprintln(w, "       browserlab browsers uninstall --image-tag TAG [--delete-image --confirm-delete-image] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab grid <start|stop|status|config> [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab session open chrome VERSION [URL] [--json] [--base-url URL]")
 	fmt.Fprintln(w, "       browserlab daemon <install|start|stop|restart|status|logs> [--daemon-path PATH]")
@@ -108,6 +111,15 @@ func runInstall(args []string, stdout io.Writer, stderr io.Writer) int {
 }
 
 func runBrowsers(args []string, stdout io.Writer, stderr io.Writer) int {
+	if len(args) > 0 {
+		switch args[0] {
+		case "disable":
+			return runBrowserDisable(args[1:], stdout, stderr)
+		case "uninstall":
+			return runBrowserUninstall(args[1:], stdout, stderr)
+		}
+	}
+
 	flags := flag.NewFlagSet("browsers", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	jsonOutput := flags.Bool("json", false, "write machine-readable JSON")
@@ -139,6 +151,72 @@ func runBrowsers(args []string, stdout io.Writer, stderr io.Writer) int {
 		return 0
 	}
 	writeBrowsersHuman(stdout, list)
+	return 0
+}
+
+func runBrowserDisable(args []string, stdout io.Writer, stderr io.Writer) int {
+	parsed, err := parseBrowserManagementArgs("browsers disable", args, false)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "usage: browserlab browsers disable --image-tag TAG [--json] [--base-url URL]")
+		return 64
+	}
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := disableBrowser(ctx, parsed.baseURL, appSupport.Token, browser.DisableRequest{ImageTag: parsed.imageTag})
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "disable_failed", err.Error())
+		return 2
+	}
+	if parsed.jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(result)
+		return 0
+	}
+	fmt.Fprintf(stdout, "Disabled Chrome %s.\n", result.Record.Version)
+	fmt.Fprintf(stdout, "Image: %s\n", result.Record.ImageTag)
+	return 0
+}
+
+func runBrowserUninstall(args []string, stdout io.Writer, stderr io.Writer) int {
+	parsed, err := parseBrowserManagementArgs("browsers uninstall", args, true)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		fmt.Fprintln(stderr, "usage: browserlab browsers uninstall --image-tag TAG [--delete-image --confirm-delete-image] [--json] [--base-url URL]")
+		return 64
+	}
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "config_error", err.Error())
+		return 1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	result, err := uninstallBrowser(ctx, parsed.baseURL, appSupport.Token, browser.UninstallRequest{
+		ImageTag:           parsed.imageTag,
+		DeleteImage:        parsed.deleteImage,
+		ConfirmDeleteImage: parsed.confirmDeleteImage,
+	})
+	if err != nil {
+		writeProblem(stdout, parsed.jsonOutput, "uninstall_failed", err.Error())
+		return 2
+	}
+	if parsed.jsonOutput {
+		_ = json.NewEncoder(stdout).Encode(result)
+		return 0
+	}
+	fmt.Fprintf(stdout, "Uninstalled Chrome %s from Browser Registry.\n", result.Record.Version)
+	if result.ImageDeleted {
+		fmt.Fprintf(stdout, "Deleted Docker image: %s\n", result.Record.ImageTag)
+	} else {
+		fmt.Fprintf(stdout, "Docker image retained: %s\n", result.Record.ImageTag)
+	}
 	return 0
 }
 
@@ -539,6 +617,62 @@ func fetchInstalledBrowsers(ctx context.Context, baseURL string, token string) (
 	return list, nil
 }
 
+func disableBrowser(ctx context.Context, baseURL string, token string, request browser.DisableRequest) (api.BrowserDisableResponse, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return api.BrowserDisableResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/browsers/disable", bytes.NewReader(data))
+	if err != nil {
+		return api.BrowserDisableResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.BrowserDisableResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.BrowserDisableResponse{}, decodeProblem(resp)
+	}
+
+	var result api.BrowserDisableResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.BrowserDisableResponse{}, err
+	}
+	return result, nil
+}
+
+func uninstallBrowser(ctx context.Context, baseURL string, token string, request browser.UninstallRequest) (api.BrowserUninstallResponse, error) {
+	data, err := json.Marshal(request)
+	if err != nil {
+		return api.BrowserUninstallResponse{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/v1/browsers/uninstall", bytes.NewReader(data))
+	if err != nil {
+		return api.BrowserUninstallResponse{}, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return api.BrowserUninstallResponse{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return api.BrowserUninstallResponse{}, decodeProblem(resp)
+	}
+
+	var result api.BrowserUninstallResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return api.BrowserUninstallResponse{}, err
+	}
+	return result, nil
+}
+
 func fetchGridStatus(ctx context.Context, baseURL string, token string) (api.GridStatusResponse, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+"/v1/grid/status", nil)
 	if err != nil {
@@ -716,6 +850,37 @@ func parseSessionOpenArgs(args []string) (sessionOpenArgs, error) {
 	}
 	if len(positionals) > 3 {
 		return sessionOpenArgs{}, fmt.Errorf("too many positional arguments")
+	}
+	return parsed, nil
+}
+
+type browserManagementArgs struct {
+	imageTag           string
+	deleteImage        bool
+	confirmDeleteImage bool
+	jsonOutput         bool
+	baseURL            string
+}
+
+func parseBrowserManagementArgs(command string, args []string, allowDeleteImage bool) (browserManagementArgs, error) {
+	parsed := browserManagementArgs{baseURL: defaultBaseURL}
+	flags := flag.NewFlagSet(command, flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	flags.StringVar(&parsed.imageTag, "image-tag", "", "installed browser image tag")
+	flags.BoolVar(&parsed.jsonOutput, "json", false, "write machine-readable JSON")
+	flags.StringVar(&parsed.baseURL, "base-url", defaultBaseURL, "daemon base URL")
+	if allowDeleteImage {
+		flags.BoolVar(&parsed.deleteImage, "delete-image", false, "delete local Docker image")
+		flags.BoolVar(&parsed.confirmDeleteImage, "confirm-delete-image", false, "confirm local Docker image deletion")
+	}
+	if err := flags.Parse(args); err != nil {
+		return browserManagementArgs{}, err
+	}
+	if flags.NArg() != 0 {
+		return browserManagementArgs{}, fmt.Errorf("unexpected argument: %s", flags.Arg(0))
+	}
+	if strings.TrimSpace(parsed.imageTag) == "" {
+		return browserManagementArgs{}, fmt.Errorf("--image-tag is required")
 	}
 	return parsed, nil
 }

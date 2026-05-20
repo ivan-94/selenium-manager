@@ -359,6 +359,99 @@ func TestBrowsersJSONListsInstalledRegistryEntries(t *testing.T) {
 	}
 }
 
+func TestBrowsersDisableJSONUpdatesInstalledRegistryEntry(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: imageTag,
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport: appSupport,
+	}))
+	t.Cleanup(server.Close)
+
+	var stdout bytes.Buffer
+	exitCode := Run([]string{"browsers", "disable", "--image-tag", imageTag, "--json", "--base-url", server.URL}, &stdout, &bytes.Buffer{})
+	if exitCode != 0 {
+		t.Fatalf("Run(browsers disable --json) exit = %d, want 0; output %s", exitCode, stdout.String())
+	}
+	var payload api.BrowserDisableResponse
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
+		t.Fatalf("disable JSON was invalid: %v\n%s", err, stdout.String())
+	}
+	if payload.Record.Enabled {
+		t.Fatalf("record Enabled = true, want false")
+	}
+}
+
+func TestBrowsersUninstallJSONRequiresConfirmationBeforeDeletingImage(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: imageTag,
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	remover := &cliRecordingImageRemover{}
+	server := httptest.NewServer(api.NewHandler(api.ServerOptions{
+		AppSupport:   appSupport,
+		ImageRemover: remover,
+	}))
+	t.Cleanup(server.Close)
+
+	var unconfirmedOut bytes.Buffer
+	unconfirmedExit := Run([]string{"browsers", "uninstall", "--image-tag", imageTag, "--delete-image", "--json", "--base-url", server.URL}, &unconfirmedOut, &bytes.Buffer{})
+	if unconfirmedExit != 2 {
+		t.Fatalf("unconfirmed uninstall exit = %d, want 2; output %s", unconfirmedExit, unconfirmedOut.String())
+	}
+	if !strings.Contains(unconfirmedOut.String(), "image_delete_confirmation_required") {
+		t.Fatalf("unconfirmed output = %q, want confirmation problem", unconfirmedOut.String())
+	}
+	if len(remover.removed) != 0 {
+		t.Fatalf("removed images = %#v, want none before confirmation", remover.removed)
+	}
+
+	var confirmedOut bytes.Buffer
+	confirmedExit := Run([]string{"browsers", "uninstall", "--image-tag", imageTag, "--delete-image", "--confirm-delete-image", "--json", "--base-url", server.URL}, &confirmedOut, &bytes.Buffer{})
+	if confirmedExit != 0 {
+		t.Fatalf("confirmed uninstall exit = %d, want 0; output %s", confirmedExit, confirmedOut.String())
+	}
+	var payload api.BrowserUninstallResponse
+	if err := json.Unmarshal(confirmedOut.Bytes(), &payload); err != nil {
+		t.Fatalf("uninstall JSON was invalid: %v\n%s", err, confirmedOut.String())
+	}
+	if !payload.ImageDeleted {
+		t.Fatal("ImageDeleted = false, want true")
+	}
+	if len(remover.removed) != 1 || remover.removed[0] != imageTag {
+		t.Fatalf("removed images = %#v, want confirmed image deletion", remover.removed)
+	}
+}
+
 func TestGridStartJSONReportsStableWebDriverEndpoint(t *testing.T) {
 	t.Setenv("BROWSERLAB_HOME", t.TempDir())
 	appSupport, err := config.EnsureAppSupport()
@@ -546,6 +639,15 @@ func TestSessionOpenHumanPrintsSessionDetails(t *testing.T) {
 
 type cliRecordingPuller struct {
 	requests []install.PullRequest
+}
+
+type cliRecordingImageRemover struct {
+	removed []string
+}
+
+func (remover *cliRecordingImageRemover) RemoveImage(_ context.Context, imageTag string) error {
+	remover.removed = append(remover.removed, imageTag)
+	return nil
 }
 
 type cliGridRunner struct {

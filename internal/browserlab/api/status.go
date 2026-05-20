@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ivan-94/selenium-manager/internal/browserlab/browser"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
@@ -30,6 +31,8 @@ type ServerOptions struct {
 	ImagePuller      install.ImagePuller
 	GridRunner       grid.RuntimeRunner
 	WebDriverClient  browserlabsession.WebDriverClient
+	SessionChecker   browser.SessionChecker
+	ImageRemover     browser.ImageRemover
 	HostArchitecture string
 }
 
@@ -74,6 +77,8 @@ type BrowserSearchResponse struct {
 }
 
 type BrowserInstallResponse = install.Result
+type BrowserDisableResponse = browser.DisableResult
+type BrowserUninstallResponse = browser.UninstallResult
 
 type BrowserListResponse struct {
 	Browsers []registry.BrowserRecord `json:"browsers"`
@@ -119,6 +124,11 @@ func NewHandler(options ServerOptions) http.Handler {
 		Store:     registryStore,
 		Grid:      gridManager,
 		WebDriver: options.WebDriverClient,
+	}
+	browserManager := browser.Manager{
+		Store:          registryStore,
+		SessionChecker: options.SessionChecker,
+		ImageRemover:   options.ImageRemover,
 	}
 
 	mux := http.NewServeMux()
@@ -215,6 +225,52 @@ func NewHandler(options ServerOptions) http.Handler {
 			return
 		}
 		writeJSON(w, http.StatusOK, BrowserListResponse{Browsers: browsers})
+	})
+	mux.HandleFunc("POST /v1/browsers/disable", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browser.DisableRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := browserManager.Disable(r.Context(), request)
+		if err != nil {
+			writeBrowserError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
+	})
+	mux.HandleFunc("POST /v1/browsers/uninstall", func(w http.ResponseWriter, r *http.Request) {
+		if !authorized(r, options.AppSupport.Token) {
+			writeJSON(w, http.StatusUnauthorized, StatusProblem{
+				Code:    "unauthorized",
+				Message: "missing or invalid bearer token",
+			})
+			return
+		}
+		var request browser.UninstallRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeJSON(w, http.StatusBadRequest, StatusProblem{
+				Code:    "invalid_json",
+				Message: err.Error(),
+			})
+			return
+		}
+		result, err := browserManager.Uninstall(r.Context(), request)
+		if err != nil {
+			writeBrowserError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /v1/grid/status", func(w http.ResponseWriter, r *http.Request) {
 		if !authorized(r, options.AppSupport.Token) {
@@ -438,6 +494,27 @@ func writeSessionError(w http.ResponseWriter, err error) {
 	}
 	writeJSON(w, http.StatusInternalServerError, StatusProblem{
 		Code:    "session_failed",
+		Message: err.Error(),
+	})
+}
+
+func writeBrowserError(w http.ResponseWriter, err error) {
+	var problem browser.Problem
+	if errors.As(err, &problem) {
+		status := http.StatusBadRequest
+		switch problem.Code {
+		case "active_sessions_block_uninstall":
+			status = http.StatusConflict
+		case "browser_not_installed":
+			status = http.StatusNotFound
+		case "image_delete_failed":
+			status = http.StatusBadGateway
+		}
+		writeJSON(w, status, StatusProblem{Code: problem.Code, Message: problem.Message})
+		return
+	}
+	writeJSON(w, http.StatusInternalServerError, StatusProblem{
+		Code:    "browser_management_failed",
 		Message: err.Error(),
 	})
 }

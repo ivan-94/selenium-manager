@@ -190,7 +190,33 @@ public protocol ManualSessionOpening {
     func openManualSession(browser: InstalledBrowserRecord, url: String?) async throws -> ManualSessionResponse
 }
 
-public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening {
+public struct BrowserDisableResponse: Decodable, Equatable {
+    public let record: InstalledBrowserRecord
+
+    public init(record: InstalledBrowserRecord) {
+        self.record = record
+    }
+}
+
+public struct BrowserUninstallResponse: Decodable, Equatable {
+    public let record: InstalledBrowserRecord
+    public let imageDeleted: Bool
+
+    public init(record: InstalledBrowserRecord, imageDeleted: Bool) {
+        self.record = record
+        self.imageDeleted = imageDeleted
+    }
+}
+
+public protocol InstalledBrowserDisabling {
+    func disableBrowser(record: InstalledBrowserRecord) async throws -> BrowserDisableResponse
+}
+
+public protocol InstalledBrowserUninstalling {
+    func uninstallBrowser(record: InstalledBrowserRecord, deleteImage: Bool, confirmDeleteImage: Bool) async throws -> BrowserUninstallResponse
+}
+
+public final class URLSessionBrowserSearchClient: BrowserVersionSearching, BrowserVersionInstalling, InstalledBrowserListing, ManualSessionOpening, InstalledBrowserDisabling, InstalledBrowserUninstalling {
     private let baseURL: URL
     private let tokenFile: URL
     private let session: URLSession
@@ -233,7 +259,7 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
             throw DaemonStatusClientError.badHTTPStatus(-1)
         }
         guard httpResponse.statusCode == 200 else {
-            throw DaemonStatusClientError.badHTTPStatus(httpResponse.statusCode)
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
         }
         return try JSONDecoder().decode(BrowserSearchResponse.self, from: data)
     }
@@ -257,7 +283,7 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
             throw DaemonStatusClientError.badHTTPStatus(-1)
         }
         guard httpResponse.statusCode == 200 else {
-            throw DaemonStatusClientError.badHTTPStatus(httpResponse.statusCode)
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
         }
         return try JSONDecoder().decode(BrowserInstallResponse.self, from: data)
     }
@@ -277,7 +303,7 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
             throw DaemonStatusClientError.badHTTPStatus(-1)
         }
         guard httpResponse.statusCode == 200 else {
-            throw DaemonStatusClientError.badHTTPStatus(httpResponse.statusCode)
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
         }
         return try JSONDecoder().decode(InstalledBrowsersResponse.self, from: data)
     }
@@ -301,9 +327,61 @@ public final class URLSessionBrowserSearchClient: BrowserVersionSearching, Brows
             throw DaemonStatusClientError.badHTTPStatus(-1)
         }
         guard httpResponse.statusCode == 200 else {
-            throw DaemonStatusClientError.badHTTPStatus(httpResponse.statusCode)
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
         }
         return try JSONDecoder().decode(ManualSessionResponse.self, from: data)
+    }
+
+    public func disableBrowser(record: InstalledBrowserRecord) async throws -> BrowserDisableResponse {
+        let token = try readToken()
+        let body = BrowserImageTagRequest(imageTag: record.imageTag)
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1")
+                .appendingPathComponent("browsers")
+                .appendingPathComponent("disable")
+        )
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(body)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw DaemonStatusClientError.badHTTPStatus(-1)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(BrowserDisableResponse.self, from: data)
+    }
+
+    public func uninstallBrowser(record: InstalledBrowserRecord, deleteImage: Bool, confirmDeleteImage: Bool) async throws -> BrowserUninstallResponse {
+        let token = try readToken()
+        let body = BrowserUninstallRequest(
+            imageTag: record.imageTag,
+            deleteImage: deleteImage,
+            confirmDeleteImage: confirmDeleteImage
+        )
+        var request = URLRequest(
+            url: baseURL
+                .appendingPathComponent("v1")
+                .appendingPathComponent("browsers")
+                .appendingPathComponent("uninstall")
+        )
+        request.httpMethod = "POST"
+        request.httpBody = try JSONEncoder().encode(body)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw DaemonStatusClientError.badHTTPStatus(-1)
+        }
+        guard httpResponse.statusCode == 200 else {
+            throw browserClientHTTPError(data: data, statusCode: httpResponse.statusCode)
+        }
+        return try JSONDecoder().decode(BrowserUninstallResponse.self, from: data)
     }
 
     private func readToken() throws -> String {
@@ -346,6 +424,28 @@ private struct ManualSessionRequest: Encodable {
     }
 }
 
+private struct BrowserImageTagRequest: Encodable {
+    let imageTag: String
+}
+
+private struct BrowserUninstallRequest: Encodable {
+    let imageTag: String
+    let deleteImage: Bool
+    let confirmDeleteImage: Bool
+}
+
+private struct BrowserClientProblem: Decodable {
+    let code: String
+    let message: String
+}
+
+private func browserClientHTTPError(data: Data, statusCode: Int) -> Error {
+    if let problem = try? JSONDecoder().decode(BrowserClientProblem.self, from: data) {
+        return DaemonStatusClientError.apiProblem(problem.code, problem.message)
+    }
+    return DaemonStatusClientError.badHTTPStatus(statusCode)
+}
+
 public struct BrowserSearchRow: Equatable, Identifiable {
     public let id: String
     public let title: String
@@ -373,23 +473,32 @@ public final class BrowserSearchViewModel: ObservableObject {
     @Published public var targetURL: String = ""
     @Published public private(set) var activeSession: ManualSessionResponse?
     @Published public private(set) var installMessages: [String: String] = [:]
+    @Published public private(set) var installedMessages: [String: String] = [:]
+    @Published public var deleteImageOnUninstall: Bool = false
+    @Published public var confirmDeleteImage: Bool = false
     @Published public private(set) var errorMessage: String?
 
     private let client: BrowserVersionSearching
     private let installer: BrowserVersionInstalling?
     private let lister: InstalledBrowserListing?
     private let sessionOpener: ManualSessionOpening?
+    private let disabler: InstalledBrowserDisabling?
+    private let uninstaller: InstalledBrowserUninstalling?
 
     public init(
         client: BrowserVersionSearching,
         installer: BrowserVersionInstalling? = nil,
         lister: InstalledBrowserListing? = nil,
-        sessionOpener: ManualSessionOpening? = nil
+        sessionOpener: ManualSessionOpening? = nil,
+        disabler: InstalledBrowserDisabling? = nil,
+        uninstaller: InstalledBrowserUninstalling? = nil
     ) {
         self.client = client
         self.installer = installer
         self.lister = lister
         self.sessionOpener = sessionOpener
+        self.disabler = disabler
+        self.uninstaller = uninstaller
     }
 
     public func search(query: String? = nil) async {
@@ -462,6 +571,36 @@ public final class BrowserSearchViewModel: ObservableObject {
     public var activeNoVNCURL: URL? {
         guard let raw = activeSession?.noVnc.url else { return nil }
         return URL(string: raw)
+    }
+
+    public func disable(record: InstalledBrowserRecord) async {
+        guard let disabler else { return }
+        do {
+            let response = try await disabler.disableBrowser(record: record)
+            installedMessages[record.imageTag] = "Disabled Chrome \(response.record.version)"
+            await refreshInstalledBrowsers()
+        } catch {
+            installedMessages[record.imageTag] = error.localizedDescription
+        }
+    }
+
+    public func uninstall(record: InstalledBrowserRecord, deleteImage: Bool, confirmDeleteImage: Bool) async {
+        guard let uninstaller else { return }
+        do {
+            let response = try await uninstaller.uninstallBrowser(
+                record: record,
+                deleteImage: deleteImage,
+                confirmDeleteImage: confirmDeleteImage
+            )
+            if response.imageDeleted {
+                installedMessages[record.imageTag] = "Uninstalled Chrome \(response.record.version)\nDeleted Docker image: \(response.record.imageTag)"
+            } else {
+                installedMessages[record.imageTag] = "Uninstalled Chrome \(response.record.version)\nDocker image retained"
+            }
+            await refreshInstalledBrowsers()
+        } catch {
+            installedMessages[record.imageTag] = error.localizedDescription
+        }
     }
 
     private static func row(for result: BrowserSearchResult) -> BrowserSearchRow {
@@ -570,6 +709,9 @@ public struct BrowserSearchView: View {
                     .font(.headline)
                 TextField("URL", text: $viewModel.targetURL)
                     .textFieldStyle(.roundedBorder)
+                Toggle("Delete Docker image", isOn: $viewModel.deleteImageOnUninstall)
+                Toggle("Confirm image deletion", isOn: $viewModel.confirmDeleteImage)
+                    .disabled(!viewModel.deleteImageOnUninstall)
                 List(viewModel.installedRows) { row in
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
@@ -582,11 +724,33 @@ public struct BrowserSearchView: View {
                                 }
                             }
                             .disabled(viewModel.openingImageTag == row.id)
+                            if row.enabled {
+                                Button("Disable") {
+                                    Task {
+                                        await viewModel.disable(record: row.record)
+                                    }
+                                }
+                            }
+                            Button("Uninstall") {
+                                Task {
+                                    await viewModel.uninstall(
+                                        record: row.record,
+                                        deleteImage: viewModel.deleteImageOnUninstall,
+                                        confirmDeleteImage: viewModel.confirmDeleteImage
+                                    )
+                                }
+                            }
                         }
                         Text(row.detail)
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
+                        if let message = viewModel.installedMessages[row.id] {
+                            Text(message)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
                     }
                     .padding(.vertical, 4)
                 }

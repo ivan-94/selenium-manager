@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ivan-94/selenium-manager/internal/browserlab/browser"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/catalog"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/config"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/grid"
@@ -485,11 +486,12 @@ func TestManualSessionEndpointCreatesHeldSessionFromInstalledBrowser(t *testing.
 	if err != nil {
 		t.Fatalf("EnsureAppSupport() error = %v", err)
 	}
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
 	store := registry.NewFileStore(appSupport.Paths.Root)
 	_, err = store.Save(registry.BrowserRecord{
 		Family:   "chrome",
 		Version:  "119.0",
-		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		ImageTag: imageTag,
 		Platform: "linux/amd64",
 		Source:   "selenium-dockerhub",
 		Enabled:  true,
@@ -551,6 +553,143 @@ func TestManualSessionEndpointCreatesHeldSessionFromInstalledBrowser(t *testing.
 	}
 }
 
+func TestBrowserManagementEndpointsDisableUninstallAndRequireImageDeleteConfirmation(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: imageTag,
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	remover := &recordingImageRemover{}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:   appSupport,
+		ImageRemover: remover,
+	}))
+	t.Cleanup(server.Close)
+
+	disableResp := postJSON(t, server.URL+"/v1/browsers/disable", appSupport.Token, `{"imageTag":"`+imageTag+`"}`)
+	defer disableResp.Body.Close()
+	if disableResp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/browsers/disable status = %d, want 200", disableResp.StatusCode)
+	}
+	var disabled BrowserDisableResponse
+	if err := json.NewDecoder(disableResp.Body).Decode(&disabled); err != nil {
+		t.Fatalf("decode disable: %v", err)
+	}
+	if disabled.Record.Enabled {
+		t.Fatalf("disabled record Enabled = true, want false")
+	}
+
+	configReq, err := http.NewRequest(http.MethodGet, server.URL+"/v1/grid/config", nil)
+	if err != nil {
+		t.Fatalf("NewRequest(config) error = %v", err)
+	}
+	configReq.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	configResp, err := http.DefaultClient.Do(configReq)
+	if err != nil {
+		t.Fatalf("GET /v1/grid/config error = %v", err)
+	}
+	defer configResp.Body.Close()
+	var config GridConfigResponse
+	if err := json.NewDecoder(configResp.Body).Decode(&config); err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if strings.Contains(config.Config.TOML, "119.0") {
+		t.Fatalf("disabled browser was still offered to Dynamic Grid:\n%s", config.Config.TOML)
+	}
+
+	unconfirmedResp := postJSON(t, server.URL+"/v1/browsers/uninstall", appSupport.Token, `{"imageTag":"`+imageTag+`","deleteImage":true}`)
+	defer unconfirmedResp.Body.Close()
+	if unconfirmedResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("unconfirmed uninstall status = %d, want 400", unconfirmedResp.StatusCode)
+	}
+	var unconfirmed StatusProblem
+	if err := json.NewDecoder(unconfirmedResp.Body).Decode(&unconfirmed); err != nil {
+		t.Fatalf("decode unconfirmed problem: %v", err)
+	}
+	if unconfirmed.Code != "image_delete_confirmation_required" {
+		t.Fatalf("problem = %+v, want image_delete_confirmation_required", unconfirmed)
+	}
+	if len(remover.removed) != 0 {
+		t.Fatalf("removed images = %#v, want none before confirmation", remover.removed)
+	}
+
+	confirmedResp := postJSON(t, server.URL+"/v1/browsers/uninstall", appSupport.Token, `{"imageTag":"`+imageTag+`","deleteImage":true,"confirmDeleteImage":true}`)
+	defer confirmedResp.Body.Close()
+	if confirmedResp.StatusCode != http.StatusOK {
+		t.Fatalf("confirmed uninstall status = %d, want 200", confirmedResp.StatusCode)
+	}
+	var uninstalled BrowserUninstallResponse
+	if err := json.NewDecoder(confirmedResp.Body).Decode(&uninstalled); err != nil {
+		t.Fatalf("decode uninstall: %v", err)
+	}
+	if !uninstalled.ImageDeleted {
+		t.Fatal("ImageDeleted = false, want true")
+	}
+	if len(remover.removed) != 1 || remover.removed[0] != imageTag {
+		t.Fatalf("removed images = %#v, want confirmed Docker image delete", remover.removed)
+	}
+}
+
+func TestBrowserUninstallEndpointBlocksActiveSessions(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	imageTag := "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404"
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: imageTag,
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	remover := &recordingImageRemover{}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:     appSupport,
+		ImageRemover:   remover,
+		SessionChecker: staticSessionChecker{sessions: []browser.ActiveSession{{ID: "session-123", BrowserName: "chrome", BrowserVersion: "119.0", ImageTag: imageTag}}},
+	}))
+	t.Cleanup(server.Close)
+
+	resp := postJSON(t, server.URL+"/v1/browsers/uninstall", appSupport.Token, `{"imageTag":"`+imageTag+`"}`)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		t.Fatalf("uninstall active status = %d, want 409", resp.StatusCode)
+	}
+	var problem StatusProblem
+	if err := json.NewDecoder(resp.Body).Decode(&problem); err != nil {
+		t.Fatalf("decode problem: %v", err)
+	}
+	if problem.Code != "active_sessions_block_uninstall" {
+		t.Fatalf("problem = %+v, want active session block", problem)
+	}
+	if len(remover.removed) != 0 {
+		t.Fatalf("removed images = %#v, want none while active", remover.removed)
+	}
+	if _, ok, err := store.FindByImageTag(imageTag); err != nil || !ok {
+		t.Fatalf("browser should remain installed while active, ok=%v err=%v", ok, err)
+	}
+}
+
 func TestDefaultListenAddrIsLocalhostOnly(t *testing.T) {
 	if !IsLocalListenAddr(DefaultListenAddr) {
 		t.Fatalf("DefaultListenAddr %q must be localhost-only", DefaultListenAddr)
@@ -578,6 +717,23 @@ func readChromeTagsFixture(t *testing.T) catalog.DockerHubTagsPage {
 type recordingPuller struct {
 	requests []install.PullRequest
 	err      error
+}
+
+type recordingImageRemover struct {
+	removed []string
+}
+
+func (remover *recordingImageRemover) RemoveImage(_ context.Context, imageTag string) error {
+	remover.removed = append(remover.removed, imageTag)
+	return nil
+}
+
+type staticSessionChecker struct {
+	sessions []browser.ActiveSession
+}
+
+func (checker staticSessionChecker) ActiveSessionsForBrowser(context.Context, registry.BrowserRecord) ([]browser.ActiveSession, error) {
+	return checker.sessions, nil
 }
 
 type apiGridRunner struct {
@@ -642,4 +798,19 @@ func (puller *recordingPuller) PullImage(_ context.Context, request install.Pull
 		report(install.ProgressEvent{Stage: "pulling", Message: "pulling " + request.ImageTag})
 	}
 	return puller.err
+}
+
+func postJSON(t *testing.T, endpoint string, token string, body string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatalf("NewRequest(%s) error = %v", endpoint, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s error = %v", endpoint, err)
+	}
+	return resp
 }

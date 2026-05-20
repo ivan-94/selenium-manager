@@ -106,6 +106,51 @@ func (store FileStore) Save(record BrowserRecord) (SaveResult, error) {
 	return SaveResult{Record: record}, nil
 }
 
+func (store FileStore) Disable(imageTag string) (BrowserRecord, error) {
+	imageTag = strings.TrimSpace(imageTag)
+	if imageTag == "" {
+		return BrowserRecord{}, fmt.Errorf("image tag is required")
+	}
+
+	file, err := store.read()
+	if err != nil {
+		return BrowserRecord{}, err
+	}
+	for index, record := range file.Browsers {
+		if record.ImageTag == imageTag {
+			record.Enabled = false
+			file.Browsers[index] = record
+			if err := store.write(file); err != nil {
+				return BrowserRecord{}, err
+			}
+			return record, nil
+		}
+	}
+	return BrowserRecord{}, fmt.Errorf("browser image %q is not installed", imageTag)
+}
+
+func (store FileStore) DeleteByImageTag(imageTag string) (BrowserRecord, bool, error) {
+	imageTag = strings.TrimSpace(imageTag)
+	if imageTag == "" {
+		return BrowserRecord{}, false, fmt.Errorf("image tag is required")
+	}
+
+	file, err := store.read()
+	if err != nil {
+		return BrowserRecord{}, false, err
+	}
+	for index, record := range file.Browsers {
+		if record.ImageTag == imageTag {
+			file.Browsers = append(file.Browsers[:index], file.Browsers[index+1:]...)
+			if err := store.write(file); err != nil {
+				return BrowserRecord{}, false, err
+			}
+			return record, true, nil
+		}
+	}
+	return BrowserRecord{}, false, nil
+}
+
 type registryDocument struct {
 	Browsers []BrowserRecord `json:"browsers"`
 }
