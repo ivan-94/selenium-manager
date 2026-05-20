@@ -17,6 +17,7 @@ import (
 	"github.com/ivan-94/selenium-manager/internal/browserlab/install"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/native"
 	"github.com/ivan-94/selenium-manager/internal/browserlab/registry"
+	browserlabsession "github.com/ivan-94/selenium-manager/internal/browserlab/session"
 )
 
 func TestStatusEndpointRequiresLocalTokenAndReturnsDaemonStatus(t *testing.T) {
@@ -478,6 +479,78 @@ func TestGridEndpointsStartFromEnabledRegistryAndExposeReadOnlyConfig(t *testing
 	}
 }
 
+func TestManualSessionEndpointCreatesHeldSessionFromInstalledBrowser(t *testing.T) {
+	t.Setenv("BROWSERLAB_HOME", t.TempDir())
+	appSupport, err := config.EnsureAppSupport()
+	if err != nil {
+		t.Fatalf("EnsureAppSupport() error = %v", err)
+	}
+	store := registry.NewFileStore(appSupport.Paths.Root)
+	_, err = store.Save(registry.BrowserRecord{
+		Family:   "chrome",
+		Version:  "119.0",
+		ImageTag: "selenium/standalone-chrome:119.0-chromedriver-119.0-grid-4.43.0-20260404",
+		Platform: "linux/amd64",
+		Source:   "selenium-dockerhub",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	webdriver := &apiWebDriver{
+		sessionID: "session-123",
+		capabilities: map[string]any{
+			"se:vnc": "ws://172.17.0.2:4444/session/session-123/se/vnc",
+		},
+		currentURL: "https://example.test/",
+		title:      "Example",
+	}
+	server := httptest.NewServer(NewHandler(ServerOptions{
+		AppSupport:      appSupport,
+		GridRunner:      &apiGridRunner{running: true},
+		WebDriverClient: webdriver,
+	}))
+	t.Cleanup(server.Close)
+
+	body := bytes.NewBufferString(`{"browserName":"chrome","browserVersion":"119.0","url":"https://example.test/"}`)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/v1/sessions/manual", body)
+	if err != nil {
+		t.Fatalf("NewRequest(session) error = %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+appSupport.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /v1/sessions/manual error = %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /v1/sessions/manual status = %d, want 200", resp.StatusCode)
+	}
+
+	var payload ManualSessionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		t.Fatalf("decode session response: %v", err)
+	}
+	if payload.SessionID != "session-123" || payload.BrowserVersion != "119.0" {
+		t.Fatalf("payload = %+v, want session id and browser version", payload)
+	}
+	if payload.CurrentURL != "https://example.test/" || payload.Title != "Example" {
+		t.Fatalf("page state = %q / %q", payload.CurrentURL, payload.Title)
+	}
+	if payload.GridURL != "http://127.0.0.1:4444" || payload.WebDriverEndpoint != "http://127.0.0.1:4444/wd/hub" {
+		t.Fatalf("grid fields = %q / %q", payload.GridURL, payload.WebDriverEndpoint)
+	}
+	if payload.NoVNC.URL != "http://127.0.0.1:4444/ui/#/sessions/session-123" {
+		t.Fatalf("noVNC URL = %q", payload.NoVNC.URL)
+	}
+	if webdriver.navigatedURL != "https://example.test/" {
+		t.Fatalf("navigated URL = %q", webdriver.navigatedURL)
+	}
+	if webdriver.quitCalled {
+		t.Fatal("manual session was quit before returning response")
+	}
+}
+
 func TestDefaultListenAddrIsLocalhostOnly(t *testing.T) {
 	if !IsLocalListenAddr(DefaultListenAddr) {
 		t.Fatalf("DefaultListenAddr %q must be localhost-only", DefaultListenAddr)
@@ -510,6 +583,39 @@ type recordingPuller struct {
 type apiGridRunner struct {
 	startRequest grid.StartRequest
 	running      bool
+}
+
+type apiWebDriver struct {
+	sessionID          string
+	capabilities       map[string]any
+	currentURL         string
+	title              string
+	newSessionEndpoint string
+	navigatedURL       string
+	quitCalled         bool
+}
+
+func (driver *apiWebDriver) NewSession(_ context.Context, request browserlabsession.NewSessionRequest) (browserlabsession.NewSessionResult, error) {
+	driver.newSessionEndpoint = request.WebDriverEndpoint
+	return browserlabsession.NewSessionResult{SessionID: driver.sessionID, Capabilities: driver.capabilities}, nil
+}
+
+func (driver *apiWebDriver) Navigate(_ context.Context, _ string, _ string, url string) error {
+	driver.navigatedURL = url
+	return nil
+}
+
+func (driver *apiWebDriver) CurrentURL(_ context.Context, _ string, _ string) (string, error) {
+	return driver.currentURL, nil
+}
+
+func (driver *apiWebDriver) Title(_ context.Context, _ string, _ string) (string, error) {
+	return driver.title, nil
+}
+
+func (driver *apiWebDriver) Quit(_ context.Context, _ string, _ string) error {
+	driver.quitCalled = true
+	return nil
 }
 
 func (runner *apiGridRunner) Start(_ context.Context, request grid.StartRequest) (grid.RuntimeState, error) {

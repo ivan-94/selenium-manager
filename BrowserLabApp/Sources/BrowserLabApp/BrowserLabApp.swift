@@ -15,7 +15,8 @@ struct BrowserLabApplication: App {
                 BrowserSearchView(viewModel: BrowserSearchViewModel(
                     client: browserClient,
                     installer: browserClient,
-                    lister: browserClient
+                    lister: browserClient,
+                    sessionOpener: browserClient
                 ))
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24)
